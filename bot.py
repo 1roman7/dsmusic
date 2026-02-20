@@ -769,7 +769,9 @@ body{
 /* ─────── PLAYER ─────── */
 .player-wrap{
   flex:1;display:flex;flex-direction:column;
-  padding:0 22px 16px;overflow:hidden;
+  padding:0 22px 18px;
+  overflow-y:auto;
+  -webkit-overflow-scrolling:touch;
 }
 .art-wrap{
   flex:1;display:flex;align-items:center;justify-content:center;
@@ -869,6 +871,9 @@ body{
 
 /* Volume */
 .vol-row{display:flex;align-items:center;gap:10px}
+
+.sleep-row{display:flex;gap:8px;align-items:center;margin-top:10px;justify-content:center;flex-wrap:wrap}
+.sleep-btn{height:32px;padding:0 10px;border-radius:10px}
 .v-icon{color:var(--sub);flex-shrink:0;cursor:pointer;display:flex;align-items:center}
 .v-icon svg{width:18px;height:18px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
 input[type=range]{
@@ -1078,6 +1083,8 @@ input[type=range]::-moz-range-thumb{
   .c-play{width:56px;height:56px}
   .c-skip{width:44px;height:44px}
   .c-side{width:38px;height:38px}
+  .sleep-btn{height:28px;padding:0 8px;font-size:.7rem}
+  .sleep-row .p-time{width:100%;text-align:center}
   .player-wrap{padding:0 18px 10px}
 }
 @media(max-width:380px){
@@ -1087,6 +1094,8 @@ input[type=range]::-moz-range-thumb{
   .c-side{width:36px;height:36px}
   .c-side svg{width:18px;height:18px}
   .c-skip svg{width:16px;height:16px}
+  .sleep-row{gap:6px;margin-top:8px}
+  .sleep-btn{height:26px;padding:0 7px;font-size:.66rem}
   .player-wrap{padding:0 14px 10px}
   .r-thumb{width:44px;height:44px;border-radius:8px}
   .result-item{padding:8px 12px;gap:10px}
@@ -1179,10 +1188,10 @@ input[type=range]::-moz-range-thumb{
       <input type="range" id="volSlider" min="0" max="200" value="50" oninput="setVol(this.value)"/>
       <span class="v-val" id="volVal">50%</span>
     </div>
-    <div style="display:flex;gap:8px;align-items:center;margin-top:10px;justify-content:center;flex-wrap:wrap">
-      <button class="lr-btn" onclick="setSleepTimer(15)">Сон 15м</button>
-      <button class="lr-btn" onclick="setSleepTimer(30)">Сон 30м</button>
-      <button class="lr-btn" onclick="setSleepTimer(0)">Сон выкл</button>
+    <div class="sleep-row">
+      <button class="lr-btn sleep-btn" onclick="setSleepTimer(15)">Сон 15м</button>
+      <button class="lr-btn sleep-btn" onclick="setSleepTimer(30)">Сон 30м</button>
+      <button class="lr-btn sleep-btn" onclick="setSleepTimer(0)">Сон выкл</button>
       <span class="p-time" id="sleepInfo">Сон: выкл</span>
     </div>
   </div>
@@ -1373,11 +1382,29 @@ const fmt = s => {
 function setThumbElement(el, track, cls) {
   if (!el) return;
   const src = (track && track.thumbnail && track.thumbnail.startsWith('http')) ? track.thumbnail : '';
+
+  const makePlaceholder = () => {
+    const d = document.createElement('div');
+    d.className = cls;
+    d.id = el.id;
+    d.innerHTML = '<div class="t-placeholder"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13M9 18c0 1.1-.9 2-2 2s-2-.9-2-2 .9-2 2-2 2 .9 2 2zm12-2c0 1.1-.9 2-2 2s-2-.9-2-2 .9-2 2-2 2 .9 2 2z"/></svg></div>';
+    return d;
+  };
+
+  let node;
   if (src) {
-    el.outerHTML = `<img class="${cls}" id="${el.id}" src="${src}" alt="" onerror="this.outerHTML='<div class=\"${cls}\"><div class=\"t-placeholder\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M9 18V5l12-2v13M9 18c0 1.1-.9 2-2 2s-2-.9-2-2 .9-2 2-2 2 .9 2 2zm12-2c0 1.1-.9 2-2 2s-2-.9-2-2 .9-2 2-2 2 .9 2 2z\"/></svg></div></div>'"/>`;
+    const img = document.createElement('img');
+    img.className = cls;
+    img.id = el.id;
+    img.alt = '';
+    img.src = src;
+    img.onerror = () => img.replaceWith(makePlaceholder());
+    node = img;
   } else {
-    el.outerHTML = `<div class="${cls}" id="${el.id}"><div class="t-placeholder"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13M9 18c0 1.1-.9 2-2 2s-2-.9-2-2 .9-2 2-2 2 .9 2 2zm12-2c0 1.1-.9 2-2 2s-2-.9-2-2 .9-2 2-2 2 .9 2 2z"/></svg></div></div>`;
+    node = makePlaceholder();
   }
+
+  if (el !== node) el.replaceWith(node);
 }
 
 function toast(msg, type = 'ok') {
