@@ -8,7 +8,7 @@ Discord Music Bot + Flask Web Panel (Mobile PWA)
     python bot.py
 """
 
-import subprocess, sys, os, shutil, random
+import subprocess, sys, os, shutil, random, audioop
 
 REQUIRED = [
     "discord.py[voice]",
@@ -18,6 +18,7 @@ REQUIRED = [
     "mutagen",
     "python-dotenv",
     "PyNaCl",
+    "gTTS",
 ]
 
 def install_deps():
@@ -43,6 +44,7 @@ import yt_dlp, asyncio, threading, json, uuid, time
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 from mutagen import File as MutaFile
+from gtts import gTTS
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -78,22 +80,102 @@ intents.message_content = True
 intents.voice_states = True
 bot = commands.Bot(command_prefix="/", intents=intents)
 player_state = {}
+state_locks = {}
+
+def get_lock(gid):
+    if gid not in state_locks:
+        state_locks[gid] = threading.Lock()
+    return state_locks[gid]
 
 YDL_STREAM = {"format":"bestaudio/best","quiet":True,"no_warnings":True,"source_address":"0.0.0.0","noplaylist":True}
 FFMPEG_OPTS = {"before_options":"-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5","options":"-vn"}
+
+class OverlayAudioSource(discord.AudioSource):
+    """Mixes short TTS over an already playing PCM source without restarting track."""
+    def __init__(self, primary, overlay=None, duck=0.45, overlay_gain=1.35):
+        self.primary = primary
+        self.overlay = overlay
+        self.duck = duck
+        self.overlay_gain = overlay_gain
+
+    def is_opus(self):
+        return False
+
+    def add_overlay(self, overlay):
+        self.overlay = overlay
+
+    @property
+    def volume(self):
+        return getattr(self.primary, 'volume', 1.0)
+
+    @volume.setter
+    def volume(self, v):
+        if hasattr(self.primary, 'volume'):
+            self.primary.volume = v
+
+    def cleanup(self):
+        try:
+            if self.overlay:
+                self.overlay.cleanup()
+        except Exception:
+            pass
+        try:
+            if self.primary:
+                self.primary.cleanup()
+        except Exception:
+            pass
+
+    def _pad(self, data, size):
+        if not data:
+            return b"\x00" * size
+        if len(data) < size:
+            return data + (b"\x00" * (size - len(data)))
+        return data[:size]
+
+    def read(self):
+        main = self.primary.read() if self.primary else b""
+        if not main:
+            return b""
+        if not self.overlay:
+            return main
+
+        ov = self.overlay.read()
+        if not ov:
+            try:
+                self.overlay.cleanup()
+            except Exception:
+                pass
+            self.overlay = None
+            return main
+
+        size = max(len(main), len(ov))
+        main_p = self._pad(main, size)
+        ov_p = self._pad(ov, size)
+        try:
+            ducked = audioop.mul(main_p, 2, self.duck)
+            boosted = audioop.mul(ov_p, 2, self.overlay_gain)
+            mixed = audioop.add(ducked, boosted, 2)
+            return mixed
+        except Exception:
+            return main
 
 def get_state(gid):
     if gid not in player_state:
         player_state[gid] = {
             "vc":None,"volume":0.5,"current":None,"queue":[],"loop":False,
             "started_at":None,"elapsed_at_pause":0,"paused":False,
-            "history":[],"shuffle":False,"seek_offset":0
+            "history":[],"shuffle":False,"seek_offset":0,"sleep_until":None,"last_current":None,"seeking":False
         }
     return player_state[gid]
 
 async def play_next(gid, seek_to=0):
     s = get_state(gid); vc = s["vc"]
     if not vc or not vc.is_connected(): return
+    if s.get("sleep_until") and time.time() >= s["sleep_until"]:
+        s["queue"] = []
+        s["current"] = None
+        s["sleep_until"] = None
+        return
     if s["loop"] and s["current"]:
         track = s["current"]
     elif s["queue"]:
@@ -101,8 +183,11 @@ async def play_next(gid, seek_to=0):
         if len(s["history"]) > 50: s["history"] = s["history"][-50:]
         track = s["queue"].pop(0)
         s["current"] = track
+        s["last_current"] = track
     else:
         s["current"] = None; s["started_at"] = None; s["seek_offset"] = 0; return
+    if not seek_to and isinstance(track, dict) and track.get("_resume_from"):
+        seek_to = int(track.get("_resume_from", 0))
     s["seek_offset"] = seek_to
     s["started_at"] = time.time() - seek_to
     s["elapsed_at_pause"] = 0
@@ -111,6 +196,9 @@ async def play_next(gid, seek_to=0):
 
     def after(err):
         if err: print(f"Error: {err}")
+        if s.get("seeking"):
+            s["seeking"] = False
+            return
         asyncio.run_coroutine_threadsafe(play_next(gid), bot.loop)
 
     try:
@@ -179,105 +267,175 @@ def api_config():
 @app.route("/api/search")
 def api_search():
     q = request.args.get("q","").strip()
-    if not q: return jsonify([])
+    offset = max(0, int(request.args.get("offset", 0) or 0))
+    limit = max(1, min(25, int(request.args.get("limit", 15) or 15)))
+    if not q:
+        return jsonify({"items": [], "next_offset": 0, "has_more": False})
+
+    def tok(txt):
+        txt = (txt or "").lower()
+        for ch in [',', '.', '!', '?', '(', ')', '[', ']', '{', '}', '\\', '/', '|', "'", '"']:
+            txt = txt.replace(ch, " ")
+        return [x for x in txt.split() if x]
+
+    q_tokens = tok(q)
     results = []
-    for t in load_library():
-        if q.lower() in t.get("title","").lower() or q.lower() in t.get("artist","").lower():
-            results.append({**t,"source":"library"})
+    if offset == 0:
+        for t in load_library():
+            title = (t.get("title") or "").lower()
+            artist = (t.get("artist") or "").lower()
+            if q.lower() in title or q.lower() in artist:
+                results.append({**t, "source": "library"})
+                continue
+            if q_tokens and any(token in title or token in artist for token in q_tokens):
+                results.append({**t, "source": "library"})
+
     try:
+        needed = min(100, offset + limit)
         with yt_dlp.YoutubeDL({"quiet":True,"no_warnings":True,"extract_flat":True,"skip_download":True}) as ydl:
-            info = ydl.extract_info(f"ytsearch10:{q}", download=False)
-            for e in (info.get("entries") or []):
-                vid = e.get("id","")
-                results.append({"id":vid,"title":e.get("title","Unknown"),"duration":e.get("duration",0),
-                    "thumbnail":f"https://img.youtube.com/vi/{vid}/mqdefault.jpg",
-                    "url":f"https://www.youtube.com/watch?v={vid}","source":"youtube"})
-    except Exception as e: print(f"YT: {e}")
-    return jsonify(results)
+            info = ydl.extract_info(f"ytsearch{needed}:{q}", download=False)
+            entries = info.get("entries") or []
+            page_entries = entries[offset:offset + limit]
+            for e in page_entries:
+                vid = e.get("id", "")
+                results.append({
+                    "id": vid,
+                    "title": e.get("title", "Unknown"),
+                    "duration": e.get("duration", 0),
+                    "thumbnail": f"https://img.youtube.com/vi/{vid}/mqdefault.jpg",
+                    "url": f"https://www.youtube.com/watch?v={vid}",
+                    "source": "youtube"
+                })
+            has_more = len(entries) > (offset + limit) and needed < 100
+    except Exception as e:
+        print(f"YT: {e}")
+        has_more = False
+
+    return jsonify({
+        "items": results,
+        "next_offset": offset + limit,
+        "has_more": has_more,
+    })
 
 @app.route("/api/play", methods=["POST"])
 def api_play():
-    data = request.json; gid = int(data.get("guild_id",0)); track = data.get("track",{})
+    data = request.json or {}; gid = int(data.get("guild_id",0)); track = data.get("track",{}); play_now = bool(data.get("play_now", False))
     if not gid: return jsonify({"error":"No guild_id"}),400
     s = get_state(gid)
     if not s["vc"] or not s["vc"].is_connected(): return jsonify({"error":"Сначала используй /plus в Discord"}),400
-    if track.get("source")=="library" and track.get("file_path"):
-        s["queue"].append({"type":"file","title":track.get("title",""),"thumbnail":track.get("thumbnail",""),
-            "duration":track.get("duration",0),"file_path":track["file_path"],"artist":track.get("artist","")})
-    else:
-        try:
-            ydl_opts = {**YDL_STREAM}
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(track.get("url",""), download=False)
-                fmts = info.get("formats",[])
-                au = None
-                # Ищем лучший аудио-формат
-                for f in reversed(fmts):
-                    if f.get("acodec") and f["acodec"] != "none" and (f.get("vcodec") == "none" or not f.get("vcodec")):
-                        au = f.get("url")
-                        break
-                if not au and fmts:
-                    au = fmts[-1].get("url")
-                if not au:
-                    au = info.get("url","")
-                s["queue"].append({"type":"stream","title":info.get("title",""),"thumbnail":info.get("thumbnail",""),
-                    "duration":info.get("duration",0),"stream_url":au,"original_url":track.get("url",""),"artist":info.get("uploader","")})
-        except Exception as e:
-            print(f"[!] YT play error: {e}")
-            return jsonify({"error":f"Ошибка загрузки: {str(e)}"}),500
-    if not s["vc"].is_playing() and not s["vc"].is_paused():
-        asyncio.run_coroutine_threadsafe(play_next(gid), bot.loop)
+    with get_lock(gid):
+        track_obj = None
+        if track.get("source")=="library" and track.get("file_path"):
+            track_obj = {"type":"file","title":track.get("title",""),"thumbnail":track.get("thumbnail",""),
+                "duration":track.get("duration",0),"file_path":track["file_path"],"artist":track.get("artist","")}
+        else:
+            try:
+                ydl_opts = {**YDL_STREAM}
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(track.get("url",""), download=False)
+                    fmts = info.get("formats",[])
+                    au = None
+                    # Ищем лучший аудио-формат
+                    for f in reversed(fmts):
+                        if f.get("acodec") and f["acodec"] != "none" and (f.get("vcodec") == "none" or not f.get("vcodec")):
+                            au = f.get("url")
+                            break
+                    if not au and fmts:
+                        au = fmts[-1].get("url")
+                    if not au:
+                        au = info.get("url","")
+                    track_obj = {"type":"stream","title":info.get("title",""),"thumbnail":info.get("thumbnail",""),
+                        "duration":info.get("duration",0),"stream_url":au,"original_url":track.get("url",""),"artist":info.get("uploader","")}
+            except Exception as e:
+                print(f"[!] YT play error: {e}")
+                return jsonify({"error":f"Ошибка загрузки: {str(e)}"}),500
+        if track_obj:
+            if play_now and (s["vc"].is_playing() or s["vc"].is_paused()):
+                if s.get("current"):
+                    s["history"].append(s["current"])
+                s["queue"].insert(0, track_obj)
+                s["current"] = None
+                s["vc"].stop()
+            else:
+                s["queue"].append(track_obj)
+        if not s["vc"].is_playing() and not s["vc"].is_paused():
+            asyncio.run_coroutine_threadsafe(play_next(gid), bot.loop)
     return jsonify({"status":"ok"})
 
 @app.route("/api/control", methods=["POST"])
 def api_control():
-    data = request.json; gid = int(data.get("guild_id",0)); action = data.get("action","")
-    s = get_state(gid); vc = s["vc"]
-    if action=="pause":
-        if vc and vc.is_playing():
-            vc.pause()
-            s["paused"] = True
-            s["elapsed_at_pause"] = int(time.time() - (s["started_at"] or time.time()))
-    elif action=="resume":
-        if vc and vc.is_paused():
-            vc.resume()
-            s["paused"] = False
-            s["started_at"] = time.time() - s["elapsed_at_pause"]
-    elif action=="skip":
-        print(f"[*] Control: SKIP (Guild {gid})")
-        if vc and (vc.is_playing() or vc.is_paused()): vc.stop()
-        else: # Force play next if something is stuck
-            asyncio.run_coroutine_threadsafe(play_next(gid), bot.loop)
-    elif action=="prev":
-        print(f"[*] Control: PREV (Guild {gid})")
-        if s.get("history") and len(s["history"]) > 0:
-            if s["current"]:
-                s["queue"].insert(0, s["current"])
-            s["queue"].insert(0, s["history"].pop())
-            s["current"] = None
-            s["seek_offset"] = 0
-            if vc and (vc.is_playing() or vc.is_paused()): vc.stop()
-            else: # Force play next if something is stuck
+    data = request.json or {}
+    gid = int(data.get("guild_id", 0))
+    action = data.get("action", "")
+    s = get_state(gid)
+    vc = s["vc"]
+    with get_lock(gid):
+        if action == "pause":
+            if vc and vc.is_playing():
+                vc.pause()
+                s["paused"] = True
+                s["elapsed_at_pause"] = int(time.time() - (s["started_at"] or time.time()))
+        elif action == "resume":
+            if vc and vc.is_paused():
+                vc.resume()
+                s["paused"] = False
+                s["started_at"] = time.time() - s["elapsed_at_pause"]
+        elif action == "skip":
+            if vc and (vc.is_playing() or vc.is_paused()):
+                vc.stop()
+            else:
                 asyncio.run_coroutine_threadsafe(play_next(gid), bot.loop)
-        else:
-            print("[!] Control: PREV - History is empty")
-    elif action=="stop":
-        s["queue"]=[]; s["current"]=None; s["started_at"]=None; s["history"]=[]
-        if vc and (vc.is_playing() or vc.is_paused()): vc.stop()
-    elif action=="volume":
-        s["volume"]=max(0.0,min(2.0,float(data.get("value",0.5))))
-        if vc and vc.source: vc.source.volume=s["volume"]
-    elif action=="loop":
-        s["loop"]=not s["loop"]
-    elif action=="shuffle":
-        s["shuffle"]=not s.get("shuffle",False)
-        if s["shuffle"] and s["queue"]:
-            random.shuffle(s["queue"])
-    elif action=="disconnect":
-        if vc and vc.is_connected():
-            asyncio.run_coroutine_threadsafe(vc.disconnect(), bot.loop)
-            s["vc"]=None; s["current"]=None; s["queue"]=[]; s["started_at"]=None; s["history"]=[]
-    return jsonify({"status":"ok","loop":s.get("loop",False),"shuffle":s.get("shuffle",False)})
+        elif action == "prev":
+            if s.get("history") and len(s["history"]) > 0:
+                if s["current"]:
+                    s["queue"].insert(0, s["current"])
+                s["queue"].insert(0, s["history"].pop())
+                s["current"] = None
+                s["seek_offset"] = 0
+                if vc and (vc.is_playing() or vc.is_paused()):
+                    vc.stop()
+                else:
+                    asyncio.run_coroutine_threadsafe(play_next(gid), bot.loop)
+        elif action == "stop":
+            s["queue"] = []
+            s["current"] = None
+            s["started_at"] = None
+            s["history"] = []
+            if vc and (vc.is_playing() or vc.is_paused()):
+                vc.stop()
+        elif action == "volume":
+            try:
+                new_vol = float(data.get("value", 0.5))
+            except (TypeError, ValueError):
+                new_vol = 0.5
+            s["volume"] = max(0.0, min(2.0, new_vol))
+            if vc and vc.source:
+                try:
+                    vc.source.volume = s["volume"]
+                except Exception:
+                    pass
+        elif action == "loop":
+            s["loop"] = not s["loop"]
+        elif action == "shuffle":
+            s["shuffle"] = not s.get("shuffle", False)
+            if s["shuffle"] and s["queue"]:
+                random.shuffle(s["queue"])
+        elif action == "clear_queue":
+            s["queue"] = []
+        elif action == "sleep_timer":
+            mins = int(data.get("minutes", 0) or 0)
+            s["sleep_until"] = (time.time() + mins * 60) if mins > 0 else None
+        elif action == "disconnect":
+            if vc and vc.is_connected():
+                asyncio.run_coroutine_threadsafe(vc.disconnect(), bot.loop)
+                s["vc"] = None
+                s["current"] = None
+                s["queue"] = []
+                s["started_at"] = None
+                s["history"] = []
+                s["sleep_until"] = None
+
+        return jsonify({"status": "ok", "loop": s.get("loop", False), "shuffle": s.get("shuffle", False), "sleep_until": s.get("sleep_until")})
 
 @app.route("/api/status")
 def api_status():
@@ -290,38 +448,118 @@ def api_status():
         elapsed = s.get("elapsed_at_pause", 0)
     else:
         elapsed = 0
+    sleep_remaining = 0
+    if s.get("sleep_until"):
+        sleep_remaining = max(0, int(s["sleep_until"] - time.time()))
+    current_for_ui = s["current"] or (s.get("last_current") if (playing or paused) else None)
     return jsonify({
         "connected": bool(vc and vc.is_connected()),
         "playing": playing,
         "paused": paused,
         "volume": s["volume"],
-        "current": s["current"],
+        "current": current_for_ui,
         "queue": s["queue"],
         "loop": s["loop"],
         "shuffle": s.get("shuffle",False),
         "has_prev": len(s.get("history",[])) > 0,
         "elapsed": elapsed,
+        "sleep_remaining": sleep_remaining,
+        "history": list(reversed((s.get("history") or [])[-30:])),
     })
+
+
+@app.route("/api/tts", methods=["POST"])
+def api_tts():
+    data = request.json or {}
+    gid = int(data.get("guild_id", 0))
+    text = (data.get("text") or "").strip()
+    lang = (data.get("lang") or "ru").strip() or "ru"
+    if not gid:
+        return jsonify({"error": "No guild_id"}), 400
+    if not text:
+        return jsonify({"error": "Введите текст"}), 400
+    if len(text) > 300:
+        return jsonify({"error": "Максимум 300 символов"}), 400
+
+    s = get_state(gid)
+    vc = s["vc"]
+    lock = get_lock(gid)
+    if not vc or not vc.is_connected():
+        return jsonify({"error": "Сначала используй /plus в Discord"}), 400
+
+    try:
+        tts_id = str(uuid.uuid4())
+        fp = os.path.join(UPLOAD_FOLDER, f"tts_{tts_id}.mp3")
+        gTTS(text=text, lang=lang).save(fp)
+
+        # If something is currently playing, overlay TTS live without restarting track.
+        with lock:
+            if vc.is_playing() and vc.source:
+                overlay_src = discord.FFmpegPCMAudio(fp, options='-vn')
+                cur_src = vc.source
+                if isinstance(cur_src, OverlayAudioSource):
+                    cur_src.add_overlay(overlay_src)
+                else:
+                    vc.source = OverlayAudioSource(cur_src, overlay_src)
+                return jsonify({"status": "ok", "mode": "overlay"})
+
+        # If paused or idle, queue as regular TTS item.
+        tts_dur = 2
+        try:
+            tts_a = MutaFile(fp)
+            if tts_a and tts_a.info:
+                tts_dur = max(1, int(tts_a.info.length))
+        except Exception:
+            tts_dur = max(1, min(20, len(text) // 14 + 1))
+
+        tts_track = {
+            "id": tts_id,
+            "type": "file",
+            "source": "tts",
+            "title": "TTS сообщение",
+            "artist": "Озвучка",
+            "duration": tts_dur,
+            "thumbnail": "",
+            "file_path": fp,
+        }
+        with lock:
+            s["queue"].insert(0, tts_track)
+            if not vc.is_paused() and not vc.is_playing():
+                asyncio.run_coroutine_threadsafe(play_next(gid), bot.loop)
+        return jsonify({"status": "ok", "mode": "queued"})
+    except Exception as e:
+        return jsonify({"error": f"Не удалось озвучить: {e}"}), 500
 
 @app.route("/api/seek", methods=["POST"])
 def api_seek():
-    data = request.json; gid = int(data.get("guild_id",0)); pos = int(data.get("position",0))
-    s = get_state(gid); vc = s["vc"]
-    if not vc or not s["current"]: return jsonify({"error":"Ничего не играет"}),400
-    if pos < 0: pos = 0
-    dur = s["current"].get("duration",0)
-    if dur and pos > dur: pos = dur
-    # Останавливаем текущее и перезапускаем с нужной позиции
-    if vc.is_playing() or vc.is_paused():
-        vc.stop()
-    # Небольшая задержка чтобы stop() сработал
-    import time as _t; _t.sleep(0.1)
+    data = request.json or {}
+    gid = int(data.get("guild_id", 0))
+    pos = int(data.get("position", 0))
+    s = get_state(gid)
+    vc = s["vc"]
+
+    with get_lock(gid):
+        if not vc or not s["current"]:
+            return jsonify({"error": "Ничего не играет"}), 400
+        if pos < 0:
+            pos = 0
+        dur = s["current"].get("duration", 0)
+        if dur and pos > dur:
+            pos = dur
+        s["seeking"] = True
+        if vc.is_playing() or vc.is_paused():
+            vc.stop()
+
+    import time as _t
+    _t.sleep(0.1)
     asyncio.run_coroutine_threadsafe(_seek_play(gid, pos), bot.loop)
-    return jsonify({"status":"ok","position":pos})
+    return jsonify({"status": "ok", "position": pos})
 
 async def _seek_play(gid, pos):
     s = get_state(gid); vc = s["vc"]
-    if not vc or not vc.is_connected() or not s["current"]: return
+    if not vc or not vc.is_connected() or not s["current"]:
+        s["seeking"] = False
+        return
     track = s["current"]
     s["seek_offset"] = pos
     s["started_at"] = time.time() - pos
@@ -344,7 +582,9 @@ async def _seek_play(gid, pos):
                 volume=s["volume"]
             )
         vc.play(src, after=after)
-    except Exception as e: print(f"seek_play: {e}")
+    except Exception as e:
+        s["seeking"] = False
+        print(f"seek_play: {e}")
 
 @app.route("/api/queue/remove", methods=["POST"])
 def api_queue_remove():
@@ -364,7 +604,7 @@ def api_queue_move():
     if 0 <= frm < len(q) and 0 <= to < len(q) and frm != to:
         item = q.pop(frm)
         q.insert(to, item)
-        return jsonify({"status":"ok"})
+    return jsonify({"status":"ok"})
     return jsonify({"error":"Invalid index"}),400
 
 @app.route("/api/upload", methods=["POST"])
@@ -468,7 +708,7 @@ body{
 @keyframes fadeIn{from{opacity:0}to{opacity:1}}
 @keyframes scaleIn{from{opacity:0;transform:scale(.94)}to{opacity:1;transform:scale(1)}}
 @keyframes spin{to{transform:rotate(360deg)}}
-@keyframes glow-p{0%,100%{box-shadow:0 0 24px var(--glow)}50%{box-shadow:0 0 48px var(--glow),0 0 80px rgba(124,58,237,0.1)}}
+@keyframes glow-p{0%{box-shadow:0 0 18px rgba(124,58,237,.28);transform:scale(1)}50%{box-shadow:0 0 34px rgba(124,58,237,.45);transform:scale(1.02)}100%{box-shadow:0 0 18px rgba(124,58,237,.28);transform:scale(1)}}
 @keyframes eq1{0%,100%{transform:scaleY(.25)}50%{transform:scaleY(1)}}
 @keyframes eq2{0%,100%{transform:scaleY(.6)}33%{transform:scaleY(.15)}66%{transform:scaleY(1)}}
 @keyframes eq3{0%,100%{transform:scaleY(.8)}40%{transform:scaleY(.1)}80%{transform:scaleY(.9)}}
@@ -644,7 +884,9 @@ body{
 /* ─────── PLAYER ─────── */
 .player-wrap{
   flex:1;display:flex;flex-direction:column;
-  padding:0 22px 16px;overflow:hidden;
+  padding:0 22px 18px;
+  overflow-y:auto;
+  -webkit-overflow-scrolling:touch;
 }
 .art-wrap{
   flex:1;display:flex;align-items:center;justify-content:center;
@@ -657,7 +899,7 @@ body{
   box-shadow:0 20px 60px rgba(0,0,0,.5);
   transition:box-shadow .5s;display:block;
 }
-.p-art.lit{animation:glow-p 4s ease-in-out infinite}
+.p-art.lit{animation:glow-p 6s cubic-bezier(.4,0,.2,1) infinite;will-change:transform,box-shadow}
 
 .p-meta{margin-bottom:18px}
 .p-title{font-size:1.2rem;font-weight:700;letter-spacing:-.3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -744,6 +986,9 @@ body{
 
 /* Volume */
 .vol-row{display:flex;align-items:center;gap:10px}
+
+.sleep-row{display:flex;gap:8px;align-items:center;margin-top:10px;justify-content:center;flex-wrap:wrap}
+.sleep-btn{height:32px;padding:0 10px;border-radius:10px}
 .v-icon{color:var(--sub);flex-shrink:0;cursor:pointer;display:flex;align-items:center}
 .v-icon svg{width:18px;height:18px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
 input[type=range]{
@@ -762,6 +1007,7 @@ input[type=range]::-moz-range-thumb{
   box-shadow:0 2px 8px rgba(0,0,0,.3);border:none;
 }
 .v-val{font-size:.7rem;color:var(--sub);min-width:34px;text-align:right}
+
 
 /* ─────── PROFILE ─────── */
 .profile-body{padding:0 16px 16px;display:flex;flex-direction:column;gap:14px}
@@ -953,6 +1199,8 @@ input[type=range]::-moz-range-thumb{
   .c-play{width:56px;height:56px}
   .c-skip{width:44px;height:44px}
   .c-side{width:38px;height:38px}
+  .sleep-btn{height:28px;padding:0 8px;font-size:.7rem}
+  .sleep-row .p-time{width:100%;text-align:center}
   .player-wrap{padding:0 18px 10px}
 }
 @media(max-width:380px){
@@ -962,6 +1210,8 @@ input[type=range]::-moz-range-thumb{
   .c-side{width:36px;height:36px}
   .c-side svg{width:18px;height:18px}
   .c-skip svg{width:16px;height:16px}
+  .sleep-row{gap:6px;margin-top:8px}
+  .sleep-btn{height:26px;padding:0 7px;font-size:.66rem}
   .player-wrap{padding:0 14px 10px}
   .r-thumb{width:44px;height:44px;border-radius:8px}
   .result-item{padding:8px 12px;gap:10px}
@@ -1004,7 +1254,7 @@ input[type=range]::-moz-range-thumb{
       </button>
     </div>
   </div>
-  <div class="scroll" id="sResults">
+  <div class="scroll" id="sResults" style="overflow-y:auto">
     <div class="empty"><div class="empty-i"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg></div><p>Введи название трека<br/>или исполнителя</p></div>
   </div>
 </div>
@@ -1054,6 +1304,13 @@ input[type=range]::-moz-range-thumb{
       <input type="range" id="volSlider" min="0" max="200" value="50" oninput="setVol(this.value)"/>
       <span class="v-val" id="volVal">50%</span>
     </div>
+    <div class="sleep-row">
+      <button class="lr-btn sleep-btn" onclick="setSleepTimer(15)">Сон 15м</button>
+      <button class="lr-btn sleep-btn" onclick="setSleepTimer(30)">Сон 30м</button>
+      <button class="lr-btn sleep-btn" onclick="setSleepTimer(0)">Сон выкл</button>
+      <span class="p-time" id="sleepInfo">Сон: выкл</span>
+    </div>
+    </div>
   </div>
 </div>
 
@@ -1077,6 +1334,13 @@ input[type=range]::-moz-range-thumb{
         <svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="3"/></svg>
         Отключить бота от канала
       </button>
+      <div class="p-card" style="margin-top:12px">
+        <div class="p-card-label">Озвучивание (TTS)</div>
+        <div class="input-row" style="display:flex;gap:8px;align-items:center">
+          <input class="field" id="ttsText" maxlength="300" placeholder="Текст для озвучки поверх музыки"/>
+          <button class="save-btn" onclick="sendTTS()">Озвучить</button>
+        </div>
+      </div>
       <label class="upload-zone" for="fileIn">
         <svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
         <div class="upload-zone-text"><strong>Загрузить свой трек</strong><span>Нажми чтобы выбрать аудио файл</span></div>
@@ -1093,6 +1357,24 @@ input[type=range]::-moz-range-thumb{
       <div>
         <div class="sec-title" style="padding:4px 4px 10px">Загруженные треки</div>
         <div class="lib-rows" id="profLib"></div>
+      </div>
+      <div class="p-card" style="margin-top:12px">
+        <div class="p-card-label" style="display:flex;justify-content:space-between;align-items:center">
+          <span>История воспроизведения</span>
+          <button class="lr-btn" style="height:28px;padding:0 10px" onclick="toggleHistory()">История</button>
+        </div>
+        <div class="lib-rows" id="historyList"></div>
+      </div>
+      <div class="p-card" style="margin-top:12px">
+        <div class="p-card-label">Инструменты</div>
+        <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px">
+          <button class="save-btn" style="padding:10px 8px" onclick="copyGuildId()">Копировать Guild ID</button>
+          <button class="save-btn" style="padding:10px 8px" onclick="pingServer()">Пинг сервера</button>
+          <button class="save-btn" style="padding:10px 8px" onclick="toggleAutoRefresh(event)">Автообновление: ON</button>
+          <button class="save-btn" style="padding:10px 8px" onclick="exportLibrary()">Экспорт библиотеки</button>
+          <button class="save-btn" style="padding:10px 8px" onclick="clearUiCache()">Очистить UI-кэш</button>
+          <button class="save-btn" style="padding:10px 8px" onclick="resetPlayerUi()">Сбросить UI плеера</button>
+        </div>
       </div>
     </div>
   </div>
@@ -1144,11 +1426,14 @@ input[type=range]::-moz-range-thumb{
 <div class="overlay" id="qOverlay">
   <div class="sheet sheet-anim" style="max-height:75vh;display:flex;flex-direction:column;padding-bottom:calc(16px + var(--safe-b))">
     <div class="handle"></div>
-    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-shrink:0">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;gap:8px;flex-shrink:0">
       <div class="sheet-title" style="margin:0">Очередь</div>
-      <button onclick="closeQueue()" style="background:none;border:none;color:var(--sub);cursor:pointer;display:flex;padding:4px">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-      </button>
+      <div style="display:flex;gap:8px;align-items:center">
+        <button class="lr-btn del" onclick="clearQueue()" style="height:30px;padding:0 10px;border-radius:8px">Очистить</button>
+        <button onclick="closeQueue()" style="background:none;border:none;color:var(--sub);cursor:pointer;display:flex;padding:4px">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>
     </div>
     <div style="overflow-y:auto;flex:1" id="qList"></div>
   </div>
@@ -1165,6 +1450,19 @@ input[type=range]::-moz-range-thumb{
       <button class="cancel-btn" onclick="closeEdit()">Отмена</button>
       <button class="save-btn" onclick="saveEdit()">Сохранить</button>
     </div>
+  </div>
+</div>
+
+<div class="overlay" id="histOverlay">
+  <div class="sheet sheet-anim" style="max-height:80vh;display:flex;flex-direction:column">
+    <div class="handle"></div>
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;flex-shrink:0">
+      <div class="sheet-title" style="margin:0">Последние 30 треков</div>
+      <button onclick="closeHistory()" style="background:none;border:none;color:var(--sub);cursor:pointer;display:flex;padding:4px">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </div>
+    <div style="overflow-y:auto;flex:1" id="historyAll"></div>
   </div>
 </div>
 
@@ -1188,11 +1486,18 @@ let isLooping = false;
 let isShuffle = false;
 let pollTid   = null;
 let prevVol   = 50;
+let lastQueueSig = '';
+let lastHistorySig = '';
+let lastTrackSig = '';
+let lastPlayingState = false;
 // Server-side elapsed — updated from /api/status
 let srvElapsed = 0;
 // Local elapsed interpolation
 let localElapsed = 0;
 let lastPollTime  = 0;
+let autoRefreshOn = true;
+let historyTracks = [];
+window.renderThumb = function(t, cls){ return `<div class="${cls}"><div class="t-placeholder"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13M9 18c0 1.1-.9 2-2 2s-2-.9-2-2 .9-2 2-2 2 .9 2 2zm12-2c0 1.1-.9 2-2 2s-2-.9-2-2 .9-2 2-2 2 .9 2 2z"/></svg></div></div>`; };
 
 // ═══════════════════════════════════════════
 //  INIT
@@ -1213,6 +1518,11 @@ if (guildId) {
 }
 loadHomeGrid();
 loadProfLib();
+const savedVol = Number(localStorage.getItem('vol') || '50');
+if (!Number.isNaN(savedVol)) {
+  document.getElementById('volSlider').value = Math.max(0, Math.min(200, savedVol));
+  document.getElementById('volVal').textContent = document.getElementById('volSlider').value + '%';
+}
 startPoll();
 
 // ═══════════════════════════════════════════
@@ -1222,6 +1532,47 @@ const fmt = s => {
   s = Math.floor(s || 0);
   return Math.floor(s / 60) + ':' + (s % 60 + '').padStart(2, '0');
 };
+
+function setThumbElement(el, track, cls) {
+  if (!el) return;
+  const src = (track && track.thumbnail && track.thumbnail.startsWith('http')) ? track.thumbnail : '';
+
+  const makePlaceholder = () => {
+    const d = document.createElement('div');
+    d.className = cls;
+    d.id = el.id;
+    d.innerHTML = '<div class="t-placeholder"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13M9 18c0 1.1-.9 2-2 2s-2-.9-2-2 .9-2 2-2 2 .9 2 2zm12-2c0 1.1-.9 2-2 2s-2-.9-2-2 .9-2 2-2 2 .9 2 2z"/></svg></div>';
+    return d;
+  };
+
+  let node;
+  if (src) {
+    const img = document.createElement('img');
+    img.className = cls;
+    img.id = el.id;
+    img.alt = '';
+    img.src = src;
+    img.onerror = () => img.replaceWith(makePlaceholder());
+    node = img;
+  } else {
+    node = makePlaceholder();
+  }
+
+  if (el !== node) el.replaceWith(node);
+}
+
+
+const escAttr = v => String(v || '').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+function getThumbPlaceholder(cls) {
+  return `<div class="${cls}"><div class="t-placeholder"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13M9 18c0 1.1-.9 2-2 2s-2-.9-2-2 .9-2 2-2 2 .9 2 2zm12-2c0 1.1-.9 2-2 2s-2-.9-2-2 .9-2 2-2 2 .9 2 2z"/></svg></div></div>`;
+}
+function getThumb(t, cls) {
+  if (t && t.thumbnail && t.thumbnail.startsWith('http')) {
+    return `<img class="${cls}" src="${escAttr(t.thumbnail)}" loading="lazy" />`;
+  }
+  return getThumbPlaceholder(cls);
+}
+window.renderThumb = getThumb;
 
 function toast(msg, type = 'ok') {
   const w = document.getElementById('toasts');
@@ -1269,6 +1620,11 @@ function applyGuild() {
 //  SEARCH
 // ═══════════════════════════════════════════
 let sDebounce = null;
+let searchQ = "";
+let searchOffset = 0;
+let searchHasMore = false;
+let searchLoading = false;
+let searchItems = [];
 function onSInput() {
   const v = document.getElementById('searchIn').value;
   document.getElementById('sClear').className = 's-clear' + (v ? ' show' : '');
@@ -1276,6 +1632,7 @@ function onSInput() {
   if (v.length > 1) sDebounce = setTimeout(doSearch, 550);
 }
 function clearS() {
+  searchQ = ''; searchOffset = 0; searchHasMore = false; searchLoading = false; searchItems = [];
   document.getElementById('searchIn').value = '';
   document.getElementById('sClear').className = 's-clear';
   document.getElementById('sResults').innerHTML =
@@ -1284,15 +1641,37 @@ function clearS() {
 async function doSearch() {
   const q = document.getElementById('searchIn').value.trim();
   if (!q) return;
+  searchQ = q;
+  searchOffset = 0;
+  searchHasMore = false;
+  searchLoading = false;
+  searchItems = [];
   const wrap = document.getElementById('sResults');
   wrap.innerHTML = '<div class="loader"><div class="spinner"></div>Ищем...</div>';
-  try {
-    const r = await fetch('/api/search?q=' + encodeURIComponent(q));
-    const data = await r.json();
-    renderSearch(data);
-  } catch { toast('Ошибка поиска', 'err'); wrap.innerHTML = ''; }
+  await loadMoreSearch(true);
 }
-function renderSearch(items) {
+
+async function loadMoreSearch(reset = false) {
+  if (!searchQ || searchLoading) return;
+  if (!reset && !searchHasMore) return;
+  searchLoading = true;
+  try {
+    const r = await fetch('/api/search?q=' + encodeURIComponent(searchQ) + '&offset=' + searchOffset + '&limit=15');
+    const data = await r.json();
+    const items = data.items || [];
+    if (reset) searchItems = items;
+    else searchItems = searchItems.concat(items);
+    searchOffset = data.next_offset || (searchOffset + items.length);
+    searchHasMore = !!data.has_more;
+    renderSearch(searchItems, searchHasMore);
+  } catch {
+    toast('Ошибка поиска', 'err');
+  } finally {
+    searchLoading = false;
+  }
+}
+
+function renderSearch(items, hasMore = false) {
   const wrap = document.getElementById('sResults');
   wrap.innerHTML = '';
   if (!items.length) {
@@ -1309,7 +1688,23 @@ function renderSearch(items) {
     const h = document.createElement('div'); h.className = 'sec-head'; h.textContent = 'YouTube'; wrap.appendChild(h);
     yt.forEach((t, i) => wrap.appendChild(mkResult(t, i + lib.length)));
   }
+  if (hasMore) {
+    const more = document.createElement('div');
+    more.className = 'loader';
+    more.style.padding = '16px';
+    more.innerHTML = '<div class="spinner"></div>Загружаем ещё...';
+    wrap.appendChild(more);
+  }
 }
+
+document.getElementById('sResults').addEventListener('scroll', () => {
+  const el = document.getElementById('sResults');
+  if (!searchHasMore || searchLoading) return;
+  if (el.scrollTop + el.clientHeight >= el.scrollHeight - 180) {
+    loadMoreSearch();
+  }
+});
+
 function mkResult(t, idx) {
   const isLib = t.source === 'library';
   const el = document.createElement('div');
@@ -1352,7 +1747,7 @@ async function playT(e, tj, isAdd) {
   try {
     const r = await fetch('/api/play', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ guild_id: guildId, track })
+      body: JSON.stringify({ guild_id: guildId, track, play_now: !isAdd })
     });
     const d = await r.json();
     if (d.error) { toast(d.error, 'err'); }
@@ -1384,13 +1779,105 @@ function doSkip()     { ctrl('skip'); }
 function doPrev()     { ctrl('prev'); }
 function toggleLoop() { ctrl('loop'); }
 function toggleShuffle() { ctrl('shuffle'); }
-function setVol(v)    { document.getElementById('volVal').textContent = v + '%'; ctrl('volume', v / 100); }
+function setVol(v)    {
+  const safe = Math.max(0, Math.min(200, Number(v) || 0));
+  document.getElementById('volVal').textContent = safe + '%';
+  document.getElementById('volSlider').value = safe;
+  localStorage.setItem('vol', String(safe));
+  ctrl('volume', safe / 100);
+}
 function mute() {
   const sl = document.getElementById('volSlider');
   if (+sl.value > 0) { prevVol = sl.value; sl.value = 0; } else sl.value = prevVol;
   setVol(sl.value);
 }
 async function doDisconnect() { await ctrl('disconnect'); toast('Бот отключён'); }
+async function clearQueue() { await ctrl('clear_queue'); toast('Очередь очищена'); doPoll(); }
+async function setSleepTimer(mins) {
+  await fetch('/api/control', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ guild_id: guildId, action: 'sleep_timer', minutes: mins })
+  });
+  toast(mins > 0 ? ('Сон через ' + mins + ' мин') : 'Таймер сна выключен');
+  doPoll();
+}
+
+
+function copyGuildId(){
+  const gid = (document.getElementById('guildInput').value || guildId || '').trim();
+  if (!gid) { toast('Guild ID пуст', 'err'); return; }
+  navigator.clipboard.writeText(gid).then(()=>toast('Guild ID скопирован')).catch(()=>toast('Не удалось скопировать', 'err'));
+}
+async function pingServer(){
+  const t0 = performance.now();
+  try {
+    const r = await fetch('/api/config');
+    if (!r.ok) throw new Error('bad');
+    const ms = Math.round(performance.now() - t0);
+    toast('Пинг: ' + ms + 'ms');
+  } catch { toast('Сервер недоступен', 'err'); }
+}
+function toggleAutoRefresh(e){
+  autoRefreshOn = !autoRefreshOn;
+  const btn = e && e.target;
+  if (btn) btn.textContent = 'Автообновление: ' + (autoRefreshOn ? 'ON' : 'OFF');
+  toast(autoRefreshOn ? 'Автообновление включено' : 'Автообновление выключено');
+}
+async function exportLibrary(){
+  try {
+    const r = await fetch('/api/library');
+    const data = await r.json();
+    const blob = new Blob([JSON.stringify(data, null, 2)], {type:'application/json'});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'library-export.json';
+    document.body.appendChild(a); a.click(); a.remove();
+    toast('Экспорт готов');
+  } catch { toast('Ошибка экспорта', 'err'); }
+}
+function clearUiCache(){
+  localStorage.removeItem('vol');
+  localStorage.removeItem('gid');
+  toast('UI-кэш очищен');
+}
+function resetPlayerUi(){
+  document.getElementById('progFill').style.width = '0%';
+  document.getElementById('mProg').style.width = '0%';
+  document.getElementById('tNow').textContent = '0:00';
+  toast('UI плеера сброшен');
+}
+
+
+function renderHistory(limit = 5){
+  const list = document.getElementById('historyList');
+  const all = document.getElementById('historyAll');
+  if (!list || !all) return;
+  const arr = (historyTracks || []);
+  if (!arr.length){
+    const empty = '<div class="empty" style="padding:14px 0"><p>История пока пуста</p></div>';
+    list.innerHTML = empty; all.innerHTML = empty; return;
+  }
+  const mk = (t, i) => '<div class="lib-row" style="padding:6px 0"><span class="q-n">'+(i+1)+'</span>'+window.renderThumb(t,'lr-art')+'<div class="lr-info"><div class="lr-title">'+(t.title||'Без названия')+'</div><div class="lr-sub">'+(t.artist||'—')+'</div></div></div>';
+  list.innerHTML = arr.slice(0, limit).map((t,i)=>mk(t,i)).join('');
+  all.innerHTML = arr.map((t,i)=>mk(t,i)).join('');
+}
+function toggleHistory(){ document.getElementById('histOverlay').classList.add('show'); }
+function closeHistory(){ document.getElementById('histOverlay').classList.remove('show'); }
+document.getElementById('histOverlay').addEventListener('click', e => { if (e.target === e.currentTarget) closeHistory(); });
+
+async function sendTTS() {
+  if (!guildId) { toast('Введи Guild ID в Профиле', 'err'); return; }
+  const text = document.getElementById('ttsText').value.trim();
+  if (!text) { toast('Введите текст', 'err'); return; }
+  const r = await fetch('/api/tts', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ guild_id: guildId, text, lang: 'ru' })
+  });
+  const d = await r.json();
+  if (d.error) toast(d.error, 'err');
+  else { toast('Озвучка добавлена в очередь'); document.getElementById('ttsText').value = ''; doPoll(); }
+}
 
 // ═══════════════════════════════════════════
 //  SEEK — progress bar click/touch
@@ -1491,7 +1978,7 @@ function startPoll() {
 }
 
 async function doPoll() {
-  if (!guildId) return;
+  if (!guildId || !autoRefreshOn) return;
   try {
     const r = await fetch('/api/status?guild_id=' + guildId);
     const s = await r.json();
@@ -1500,18 +1987,19 @@ async function doPoll() {
     isLooping = s.loop;
     srvElapsed = s.elapsed || 0;
     lastPollTime = Date.now();
+
+    const srvVol = Math.round((Number(s.volume || 0.5)) * 100);
+    const volSlider = document.getElementById('volSlider');
+    if (Number(volSlider.value) !== srvVol) {
+      volSlider.value = srvVol;
+      document.getElementById('volVal').textContent = srvVol + '%';
+      localStorage.setItem('vol', String(srvVol));
+    }
     
-    // Help function for thumbnails
-    const getThumb = (t, cls) => {
-      if (t.thumbnail && t.thumbnail.startsWith('http')) {
-        return `<img class="${cls}" src="${t.thumbnail}" onerror="this.outerHTML=getThumbPlaceholder('${cls}')" />`;
-      }
-      return getThumbPlaceholder(cls);
-    };
-    const getThumbPlaceholder = (cls) => {
-      return `<div class="${cls}"><div class="t-placeholder"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13M9 18c0 1.1-.9 2-2 2s-2-.9-2-2 .9-2 2-2 2 .9 2 2zm12-2c0 1.1-.9 2-2 2s-2-.9-2-2 .9-2 2-2 2 .9 2 2z"/></svg></div></div>`;
-    };
-    window.renderThumb = getThumb; // make it global for other functions
+    const sleepEl = document.getElementById('sleepInfo');
+    if (sleepEl) {
+      sleepEl.textContent = s.sleep_remaining > 0 ? ('Сон: ' + fmt(s.sleep_remaining)) : 'Сон: выкл';
+    }
 
     // Sync local elapsed with server value
     localElapsed = srvElapsed;
@@ -1546,21 +2034,33 @@ async function doPoll() {
     document.getElementById('btnShuffle').className = 'c-side' + (s.shuffle ? ' on' : '');
     isShuffle = s.shuffle;
 
+    const hSig = JSON.stringify((s.history || []).map(t => [t.title, t.artist, t.duration]));
+    if (hSig !== lastHistorySig) {
+      historyTracks = s.history || [];
+      renderHistory(5);
+      lastHistorySig = hSig;
+    }
+
     // Current track
-    if (s.current) {
-      const t = s.current;
-      document.getElementById('pTitle').textContent  = t.title  || 'Без названия';
-      document.getElementById('pArtist').textContent = t.artist || '—';
-      document.getElementById('mTitle').textContent  = t.title  || '—';
-      document.getElementById('mSub').textContent    = t.artist || '—';
-      
-      const artWrap = document.getElementById('pArt').parentElement;
-      const miniWrap = document.getElementById('mArt').parentElement;
-      artWrap.innerHTML = window.renderThumb(t, 'p-art' + (s.playing ? ' lit' : ''));
-      miniWrap.innerHTML = window.renderThumb(t, 'mini-art');
-      
-      totalDur = t.duration || 0;
-      document.getElementById('tEnd').textContent = fmt(totalDur);
+    const currentUi = s.current || null;
+    if (currentUi) {
+      const t = currentUi;
+      const trackSig = JSON.stringify([t.id || t.file_path || t.stream_url || t.title, t.title, t.artist, t.thumbnail, t.duration]);
+      if (trackSig !== lastTrackSig || lastPlayingState !== !!s.playing) {
+        document.getElementById('pTitle').textContent  = t.title  || 'Без названия';
+        document.getElementById('pArtist').textContent = t.artist || '—';
+        document.getElementById('mTitle').textContent  = t.title  || '—';
+        document.getElementById('mSub').textContent    = t.artist || '—';
+
+        setThumbElement(document.getElementById('pArt'), t, 'p-art' + (s.playing ? ' lit' : ''));
+        setThumbElement(document.getElementById('mArt'), t, 'mini-art');
+
+        totalDur = t.duration || 0;
+        document.getElementById('tEnd').textContent = totalDur > 0 ? fmt(totalDur) : '—:—';
+        lastTrackSig = trackSig;
+      }
+      lastPlayingState = !!s.playing;
+      document.getElementById('tNow').textContent = fmt(srvElapsed);
 
       // Show mini player ONLY when on non-player screens
       const onPlayer = document.getElementById('s-player').classList.contains('active');
@@ -1575,9 +2075,18 @@ async function doPoll() {
       document.getElementById('miniPlayer').classList.remove('visible');
       totalDur = 0;
       localElapsed = 0;
+      document.getElementById('tNow').textContent = '0:00';
+      document.getElementById('tEnd').textContent = '0:00';
+      document.getElementById('progFill').style.width = '0%';
+      document.getElementById('mProg').style.width = '0%';
+      lastTrackSig = '';
     }
 
-    renderQueue(s.queue || []);
+    const queueSig = JSON.stringify((s.queue || []).map(t => [t.title, t.duration, t.artist]));
+    if (queueSig !== lastQueueSig) {
+      renderQueue(s.queue || []);
+      lastQueueSig = queueSig;
+    }
   } catch (e) { console.error('poll error', e); }
 }
 
@@ -1601,11 +2110,11 @@ setInterval(() => {
   if (!isPlaying || isSeeking) return;
   const secSincePoll = (Date.now() - lastPollTime) / 1000;
   const displayed = Math.floor(srvElapsed + secSincePoll);
+  document.getElementById('tNow').textContent = fmt(displayed);
   if (totalDur > 0) {
     const pct = Math.min(100, (displayed / totalDur) * 100);
     document.getElementById('progFill').style.width  = pct + '%';
     document.getElementById('mProg').style.width     = pct + '%';
-    document.getElementById('tNow').textContent      = fmt(displayed);
   }
 }, 500);
 
