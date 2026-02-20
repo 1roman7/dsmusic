@@ -89,7 +89,7 @@ def get_state(gid):
         player_state[gid] = {
             "vc":None,"volume":0.5,"current":None,"queue":[],"loop":False,
             "started_at":None,"elapsed_at_pause":0,"paused":False,
-            "history":[],"shuffle":False,"seek_offset":0,"sleep_until":None
+            "history":[],"shuffle":False,"seek_offset":0,"sleep_until":None,"last_current":None
         }
     return player_state[gid]
 
@@ -108,6 +108,7 @@ async def play_next(gid, seek_to=0):
         if len(s["history"]) > 50: s["history"] = s["history"][-50:]
         track = s["queue"].pop(0)
         s["current"] = track
+        s["last_current"] = track
     else:
         s["current"] = None; s["started_at"] = None; s["seek_offset"] = 0; return
     if not seek_to and isinstance(track, dict) and track.get("_resume_from"):
@@ -355,12 +356,13 @@ def api_status():
     sleep_remaining = 0
     if s.get("sleep_until"):
         sleep_remaining = max(0, int(s["sleep_until"] - time.time()))
+    current_for_ui = s["current"] or (s.get("last_current") if (playing or paused) else None)
     return jsonify({
         "connected": bool(vc and vc.is_connected()),
         "playing": playing,
         "paused": paused,
         "volume": s["volume"],
-        "current": s["current"],
+        "current": current_for_ui,
         "queue": s["queue"],
         "loop": s["loop"],
         "shuffle": s.get("shuffle",False),
@@ -940,6 +942,15 @@ input[type=range]::-moz-range-thumb{
 }
 .v-val{font-size:.7rem;color:var(--sub);min-width:34px;text-align:right}
 
+.quick-actions{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-top:12px}
+.qa-btn{height:32px;border-radius:10px;border:1px solid var(--border);background:var(--s1);color:var(--sub2);font-size:.65rem;font-weight:700;cursor:pointer;transition:all .2s}
+.qa-btn:active{transform:scale(.96);background:var(--s2);color:#fff}
+.qa-btn.accent{border-color:rgba(124,58,237,.45);color:var(--accent2)}
+body.compact .p-title{font-size:1rem}
+body.compact .p-artist{font-size:.72rem}
+body.no-glow .p-art.lit{animation:none!important;box-shadow:0 10px 30px rgba(0,0,0,.35)}
+@media(max-width:380px){.quick-actions{grid-template-columns:repeat(3,minmax(0,1fr));}.qa-btn{height:30px;font-size:.62rem}}
+
 /* ─────── PROFILE ─────── */
 .profile-body{padding:0 16px 16px;display:flex;flex-direction:column;gap:14px}
 .p-card{background:var(--s1);border:1px solid var(--border);border-radius:var(--r);padding:16px}
@@ -1241,6 +1252,24 @@ input[type=range]::-moz-range-thumb{
       <button class="lr-btn sleep-btn" onclick="setSleepTimer(0)">Сон выкл</button>
       <span class="p-time" id="sleepInfo">Сон: выкл</span>
     </div>
+    <div class="quick-actions">
+      <button class="qa-btn" onclick="seekBack30()">-30с</button>
+      <button class="qa-btn" onclick="seekBack10()">-10с</button>
+      <button class="qa-btn" onclick="seekForward10()">+10с</button>
+      <button class="qa-btn" onclick="seekForward30()">+30с</button>
+      <button class="qa-btn" onclick="setVolPreset(25)">V 25%</button>
+      <button class="qa-btn" onclick="setVolPreset(50)">V 50%</button>
+      <button class="qa-btn" onclick="setVolPreset(100)">V 100%</button>
+      <button class="qa-btn" onclick="setVolPreset(150)">V 150%</button>
+      <button class="qa-btn" onclick="copyTrackTitle()">Коп. трек</button>
+      <button class="qa-btn" onclick="copyTrackArtist()">Коп. артиста</button>
+      <button class="qa-btn" onclick="openCurrentInYouTube()">Открыть YT</button>
+      <button class="qa-btn" onclick="copyTrackUrl()">Коп. ссылку</button>
+      <button class="qa-btn accent" onclick="refreshNow()">Обновить</button>
+      <button class="qa-btn" onclick="toggleCompactMode()">Compact</button>
+      <button class="qa-btn" onclick="toggleGlow()">Glow</button>
+      <button class="qa-btn" onclick="focusSearchFromPlayer()">Поиск</button>
+    </div>
   </div>
 </div>
 
@@ -1391,6 +1420,7 @@ let srvElapsed = 0;
 // Local elapsed interpolation
 let localElapsed = 0;
 let lastPollTime  = 0;
+let currentTrack = null;
 
 // ═══════════════════════════════════════════
 //  INIT
@@ -1681,6 +1711,29 @@ async function setSleepTimer(mins) {
   toast(mins > 0 ? ('Сон через ' + mins + ' мин') : 'Таймер сна выключен');
   doPoll();
 }
+
+function seekBack30(){ seekRelative(-30); }
+function seekBack10(){ seekRelative(-10); }
+function seekForward10(){ seekRelative(10); }
+function seekForward30(){ seekRelative(30); }
+function setVolPreset(v){ setVol(v); }
+async function copyTextSafe(text, okMsg){
+  if (!text) { toast('Нет данных', 'err'); return; }
+  try { await navigator.clipboard.writeText(text); toast(okMsg || 'Скопировано'); }
+  catch { toast('Не удалось скопировать', 'err'); }
+}
+function copyTrackTitle(){ copyTextSafe((currentTrack && currentTrack.title) || '', 'Название скопировано'); }
+function copyTrackArtist(){ copyTextSafe((currentTrack && currentTrack.artist) || '', 'Исполнитель скопирован'); }
+function copyTrackUrl(){ copyTextSafe((currentTrack && (currentTrack.original_url || currentTrack.url)) || '', 'Ссылка скопирована'); }
+function openCurrentInYouTube(){
+  const u = currentTrack && (currentTrack.original_url || currentTrack.url);
+  if (!u) { toast('Для этого трека нет ссылки', 'err'); return; }
+  window.open(u, '_blank');
+}
+function refreshNow(){ doPoll(); toast('Обновлено'); }
+function toggleCompactMode(){ document.body.classList.toggle('compact'); }
+function toggleGlow(){ document.body.classList.toggle('no-glow'); }
+function focusSearchFromPlayer(){ goScreen('search'); setTimeout(()=>document.getElementById('searchIn').focus(), 140); }
 async function sendTTS() {
   if (!guildId) { toast('Введи Guild ID в Профиле', 'err'); return; }
   const text = document.getElementById('ttsText').value.trim();
@@ -1865,6 +1918,7 @@ async function doPoll() {
     isShuffle = s.shuffle;
 
     // Current track
+    currentTrack = s.current || null;
     if (s.current) {
       const t = s.current;
       document.getElementById('pTitle').textContent  = t.title  || 'Без названия';
@@ -1896,6 +1950,7 @@ async function doPoll() {
       document.getElementById('tEnd').textContent = '0:00';
       document.getElementById('progFill').style.width = '0%';
       document.getElementById('mProg').style.width = '0%';
+      currentTrack = null;
     }
 
     const queueSig = JSON.stringify((s.queue || []).map(t => [t.title, t.duration, t.artist]));
