@@ -8,7 +8,7 @@ Discord Music Bot + Flask Web Panel (Mobile PWA)
     python bot.py
 """
 
-import subprocess, sys, os, shutil, random
+import subprocess, sys, os, shutil, random, audioop
 
 REQUIRED = [
     "discord.py[voice]",
@@ -83,6 +83,75 @@ player_state = {}
 
 YDL_STREAM = {"format":"bestaudio/best","quiet":True,"no_warnings":True,"source_address":"0.0.0.0","noplaylist":True}
 FFMPEG_OPTS = {"before_options":"-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5","options":"-vn"}
+
+class OverlayAudioSource(discord.AudioSource):
+    """Mixes short TTS over an already playing PCM source without restarting track."""
+    def __init__(self, primary, overlay=None, duck=0.45, overlay_gain=1.35):
+        self.primary = primary
+        self.overlay = overlay
+        self.duck = duck
+        self.overlay_gain = overlay_gain
+
+    def is_opus(self):
+        return False
+
+    def add_overlay(self, overlay):
+        self.overlay = overlay
+
+    @property
+    def volume(self):
+        return getattr(self.primary, 'volume', 1.0)
+
+    @volume.setter
+    def volume(self, v):
+        if hasattr(self.primary, 'volume'):
+            self.primary.volume = v
+
+    def cleanup(self):
+        try:
+            if self.overlay:
+                self.overlay.cleanup()
+        except Exception:
+            pass
+        try:
+            if self.primary:
+                self.primary.cleanup()
+        except Exception:
+            pass
+
+    def _pad(self, data, size):
+        if not data:
+            return b"\x00" * size
+        if len(data) < size:
+            return data + (b"\x00" * (size - len(data)))
+        return data[:size]
+
+    def read(self):
+        main = self.primary.read() if self.primary else b""
+        if not main:
+            return b""
+        if not self.overlay:
+            return main
+
+        ov = self.overlay.read()
+        if not ov:
+            try:
+                self.overlay.cleanup()
+            except Exception:
+                pass
+            self.overlay = None
+            return main
+
+        size = max(len(main), len(ov))
+        main_p = self._pad(main, size)
+        ov_p = self._pad(ov, size)
+        try:
+            ducked = audioop.mul(main_p, 2, self.duck)
+            boosted = audioop.mul(ov_p, 2, self.overlay_gain)
+            mixed = audioop.add(ducked, boosted, 2)
+            return mixed
+        except Exception:
+            return main
 
 def get_state(gid):
     if gid not in player_state:
@@ -376,47 +445,6 @@ def api_status():
     })
 
 
-def build_tts_overlay_track(current_track, tts_file, elapsed_sec, tts_duration):
-    """Create short mixed segment (ducked music + TTS) from current position."""
-    if not current_track:
-        return None
-    src = current_track.get("file_path") if current_track.get("type") == "file" else current_track.get("stream_url")
-    if not src:
-        return None
-
-    out_fp = os.path.join(UPLOAD_FOLDER, f"mix_{uuid.uuid4()}.mp3")
-    dur = max(1, int(tts_duration))
-    fade = min(0.25, dur / 3)
-
-    # During TTS: music is ducked; at beginning/end apply tiny fades for smoother feel.
-    duck_expr = f"if(lt(t,{fade:.3f}),1-(0.6*t/{fade:.3f}),if(lt(t,{max(0.0, dur - fade):.3f}),0.4,0.4+(0.6*(t-{max(0.0, dur - fade):.3f})/{fade:.3f})))"
-    cmd = [
-        "ffmpeg", "-y",
-        "-ss", str(max(0, int(elapsed_sec))),
-        "-i", src,
-        "-i", tts_file,
-        "-filter_complex", f"[0:a]atrim=0:{dur},volume='{duck_expr}'[m];[1:a]atrim=0:{dur},volume=1.65[t];[m][t]amix=inputs=2:duration=shortest:dropout_transition=0[a]",
-        "-map", "[a]",
-        "-c:a", "libmp3lame", "-q:a", "4",
-        out_fp,
-    ]
-    try:
-        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
-    except Exception as e:
-        print(f"[!] TTS overlay ffmpeg error: {e}")
-        return None
-
-    return {
-        "id": str(uuid.uuid4()),
-        "type": "file",
-        "source": "tts_overlay",
-        "title": f"{(current_track.get('title') or 'Track')} + TTS",
-        "artist": current_track.get("artist") or "—",
-        "duration": dur,
-        "thumbnail": current_track.get("thumbnail", ""),
-        "file_path": out_fp,
-    }
-
 @app.route("/api/tts", methods=["POST"])
 def api_tts():
     data = request.json or {}
@@ -429,15 +457,28 @@ def api_tts():
         return jsonify({"error": "Введите текст"}), 400
     if len(text) > 300:
         return jsonify({"error": "Максимум 300 символов"}), 400
+
     s = get_state(gid)
     vc = s["vc"]
     if not vc or not vc.is_connected():
         return jsonify({"error": "Сначала используй /plus в Discord"}), 400
+
     try:
         tts_id = str(uuid.uuid4())
         fp = os.path.join(UPLOAD_FOLDER, f"tts_{tts_id}.mp3")
         gTTS(text=text, lang=lang).save(fp)
 
+        # If something is currently playing, overlay TTS live without restarting track.
+        if vc.is_playing() and vc.source:
+            overlay_src = discord.FFmpegPCMAudio(fp, options='-vn')
+            cur_src = vc.source
+            if isinstance(cur_src, OverlayAudioSource):
+                cur_src.add_overlay(overlay_src)
+            else:
+                vc.source = OverlayAudioSource(cur_src, overlay_src)
+            return jsonify({"status": "ok", "mode": "overlay"})
+
+        # If paused or idle, queue as regular TTS item.
         tts_dur = 2
         try:
             tts_a = MutaFile(fp)
@@ -456,30 +497,10 @@ def api_tts():
             "thumbnail": "",
             "file_path": fp,
         }
-
-        base_track = s.get("current") or s.get("last_current")
-        if (vc.is_playing() or vc.is_paused()) and base_track:
-            elapsed = s.get("elapsed_at_pause", 0) if vc.is_paused() else int(time.time() - (s.get("started_at") or time.time()))
-            overlay_track = build_tts_overlay_track(base_track, fp, elapsed, tts_dur)
-            if overlay_track:
-                resume_track = dict(base_track)
-                resume_track["_resume_from"] = max(0, elapsed + tts_dur)
-                s["queue"].insert(0, resume_track)
-                s["queue"].insert(0, overlay_track)
-            else:
-                # fallback: immediate TTS then resume from same position
-                resume_track = dict(base_track)
-                resume_track["_resume_from"] = max(0, elapsed)
-                s["queue"].insert(0, resume_track)
-                s["queue"].insert(0, tts_track)
-            s["current"] = None
-            vc.stop()
-        else:
-            s["queue"].append(tts_track)
-            if not vc.is_playing() and not vc.is_paused():
-                asyncio.run_coroutine_threadsafe(play_next(gid), bot.loop)
-
-        return jsonify({"status": "ok"})
+        s["queue"].insert(0, tts_track)
+        if not vc.is_paused() and not vc.is_playing():
+            asyncio.run_coroutine_threadsafe(play_next(gid), bot.loop)
+        return jsonify({"status": "ok", "mode": "queued"})
     except Exception as e:
         return jsonify({"error": f"Не удалось озвучить: {e}"}), 500
 
