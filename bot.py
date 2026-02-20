@@ -373,43 +373,40 @@ def api_status():
 
 
 def build_tts_overlay_track(current_track, tts_file, elapsed_sec, tts_duration):
-    """Create a temporary mixed track where TTS overlays current music."""
+    """Create short mixed segment (ducked music + TTS) from current position."""
     if not current_track:
         return None
     src = current_track.get("file_path") if current_track.get("type") == "file" else current_track.get("stream_url")
     if not src:
         return None
+
     out_fp = os.path.join(UPLOAD_FOLDER, f"mix_{uuid.uuid4()}.mp3")
+    dur = max(1, int(tts_duration))
+    fade = min(0.25, dur / 3)
+
+    # During TTS: music is ducked; at beginning/end apply tiny fades for smoother feel.
+    duck_expr = f"if(lt(t,{fade:.3f}),1-(0.6*t/{fade:.3f}),if(lt(t,{max(0.0, dur - fade):.3f}),0.4,0.4+(0.6*(t-{max(0.0, dur - fade):.3f})/{fade:.3f})))"
     cmd = [
         "ffmpeg", "-y",
         "-ss", str(max(0, int(elapsed_sec))),
         "-i", src,
         "-i", tts_file,
-        "-filter_complex", f"[0:a]atrim=0:{max(1, int(tts_duration)+1)},volume=0.42[m];[1:a]volume=1.65[t];[m][t]amix=inputs=2:duration=first:dropout_transition=0[a]",
+        "-filter_complex", f"[0:a]atrim=0:{dur},volume='{duck_expr}'[m];[1:a]atrim=0:{dur},volume=1.65[t];[m][t]amix=inputs=2:duration=shortest:dropout_transition=0[a]",
         "-map", "[a]",
         "-c:a", "libmp3lame", "-q:a", "4",
         out_fp,
     ]
     try:
-        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=90)
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
     except Exception as e:
         print(f"[!] TTS overlay ffmpeg error: {e}")
         return None
 
-    dur = 0
-    try:
-        a = MutaFile(out_fp)
-        if a and a.info:
-            dur = int(a.info.length)
-    except Exception:
-        pass
-
-    title = current_track.get("title") or "Track"
     return {
         "id": str(uuid.uuid4()),
         "type": "file",
         "source": "tts_overlay",
-        "title": f"{title} + TTS",
+        "title": f"{(current_track.get('title') or 'Track')} + TTS",
         "artist": current_track.get("artist") or "—",
         "duration": dur,
         "thumbnail": current_track.get("thumbnail", ""),
@@ -456,12 +453,21 @@ def api_tts():
             "file_path": fp,
         }
 
-        if (vc.is_playing() or vc.is_paused()) and s.get("current"):
+        base_track = s.get("current") or s.get("last_current")
+        if (vc.is_playing() or vc.is_paused()) and base_track:
             elapsed = s.get("elapsed_at_pause", 0) if vc.is_paused() else int(time.time() - (s.get("started_at") or time.time()))
-            resume_track = dict(s["current"])
-            resume_track["_resume_from"] = max(0, elapsed)
-            s["queue"].insert(0, resume_track)
-            s["queue"].insert(0, tts_track)
+            overlay_track = build_tts_overlay_track(base_track, fp, elapsed, tts_dur)
+            if overlay_track:
+                resume_track = dict(base_track)
+                resume_track["_resume_from"] = max(0, elapsed + tts_dur)
+                s["queue"].insert(0, resume_track)
+                s["queue"].insert(0, overlay_track)
+            else:
+                # fallback: immediate TTS then resume from same position
+                resume_track = dict(base_track)
+                resume_track["_resume_from"] = max(0, elapsed)
+                s["queue"].insert(0, resume_track)
+                s["queue"].insert(0, tts_track)
             s["current"] = None
             vc.stop()
         else:
