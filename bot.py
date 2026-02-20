@@ -436,13 +436,14 @@ def api_tts():
         tts_id = str(uuid.uuid4())
         fp = os.path.join(UPLOAD_FOLDER, f"tts_{tts_id}.mp3")
         gTTS(text=text, lang=lang).save(fp)
-        tts_dur = 0
+
+        tts_dur = 2
         try:
             tts_a = MutaFile(fp)
             if tts_a and tts_a.info:
                 tts_dur = max(1, int(tts_a.info.length))
         except Exception:
-            tts_dur = 0
+            tts_dur = max(1, min(20, len(text) // 14 + 1))
 
         tts_track = {
             "id": tts_id,
@@ -454,25 +455,20 @@ def api_tts():
             "thumbnail": "",
             "file_path": fp,
         }
-        if (vc.is_playing() or vc.is_paused()) and s.get("current") and tts_dur > 0:
+
+        if (vc.is_playing() or vc.is_paused()) and s.get("current"):
             elapsed = s.get("elapsed_at_pause", 0) if vc.is_paused() else int(time.time() - (s.get("started_at") or time.time()))
-            overlay_track = build_tts_overlay_track(s.get("current"), fp, elapsed, tts_dur)
-            if overlay_track:
-                resume_track = dict(s["current"])
-                resume_track["_resume_from"] = max(0, elapsed + tts_dur)
-                s["queue"].insert(0, resume_track)
-                s["queue"].insert(0, overlay_track)
-                s["current"] = None
-                vc.stop()
-            else:
-                # Fallback: if mixing failed, enqueue plain TTS as next item
-                s["queue"].insert(0, tts_track)
-                s["current"] = None
-                vc.stop()
+            resume_track = dict(s["current"])
+            resume_track["_resume_from"] = max(0, elapsed)
+            s["queue"].insert(0, resume_track)
+            s["queue"].insert(0, tts_track)
+            s["current"] = None
+            vc.stop()
         else:
             s["queue"].append(tts_track)
             if not vc.is_playing() and not vc.is_paused():
                 asyncio.run_coroutine_threadsafe(play_next(gid), bot.loop)
+
         return jsonify({"status": "ok"})
     except Exception as e:
         return jsonify({"error": f"Не удалось озвучить: {e}"}), 500
@@ -942,14 +938,6 @@ input[type=range]::-moz-range-thumb{
 }
 .v-val{font-size:.7rem;color:var(--sub);min-width:34px;text-align:right}
 
-.quick-actions{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-top:12px}
-.qa-btn{height:32px;border-radius:10px;border:1px solid var(--border);background:var(--s1);color:var(--sub2);font-size:.65rem;font-weight:700;cursor:pointer;transition:all .2s}
-.qa-btn:active{transform:scale(.96);background:var(--s2);color:#fff}
-.qa-btn.accent{border-color:rgba(124,58,237,.45);color:var(--accent2)}
-body.compact .p-title{font-size:1rem}
-body.compact .p-artist{font-size:.72rem}
-body.no-glow .p-art.lit{animation:none!important;box-shadow:0 10px 30px rgba(0,0,0,.35)}
-@media(max-width:380px){.quick-actions{grid-template-columns:repeat(3,minmax(0,1fr));}.qa-btn{height:30px;font-size:.62rem}}
 
 /* ─────── PROFILE ─────── */
 .profile-body{padding:0 16px 16px;display:flex;flex-direction:column;gap:14px}
@@ -1252,23 +1240,6 @@ body.no-glow .p-art.lit{animation:none!important;box-shadow:0 10px 30px rgba(0,0
       <button class="lr-btn sleep-btn" onclick="setSleepTimer(0)">Сон выкл</button>
       <span class="p-time" id="sleepInfo">Сон: выкл</span>
     </div>
-    <div class="quick-actions">
-      <button class="qa-btn" onclick="seekBack30()">-30с</button>
-      <button class="qa-btn" onclick="seekBack10()">-10с</button>
-      <button class="qa-btn" onclick="seekForward10()">+10с</button>
-      <button class="qa-btn" onclick="seekForward30()">+30с</button>
-      <button class="qa-btn" onclick="setVolPreset(25)">V 25%</button>
-      <button class="qa-btn" onclick="setVolPreset(50)">V 50%</button>
-      <button class="qa-btn" onclick="setVolPreset(100)">V 100%</button>
-      <button class="qa-btn" onclick="setVolPreset(150)">V 150%</button>
-      <button class="qa-btn" onclick="copyTrackTitle()">Коп. трек</button>
-      <button class="qa-btn" onclick="copyTrackArtist()">Коп. артиста</button>
-      <button class="qa-btn" onclick="openCurrentInYouTube()">Открыть YT</button>
-      <button class="qa-btn" onclick="copyTrackUrl()">Коп. ссылку</button>
-      <button class="qa-btn accent" onclick="refreshNow()">Обновить</button>
-      <button class="qa-btn" onclick="toggleCompactMode()">Compact</button>
-      <button class="qa-btn" onclick="toggleGlow()">Glow</button>
-      <button class="qa-btn" onclick="focusSearchFromPlayer()">Поиск</button>
     </div>
   </div>
 </div>
@@ -1298,6 +1269,17 @@ body.no-glow .p-art.lit{animation:none!important;box-shadow:0 10px 30px rgba(0,0
         <div class="input-row" style="display:flex;gap:8px;align-items:center">
           <input class="field" id="ttsText" maxlength="300" placeholder="Текст для озвучки поверх музыки"/>
           <button class="save-btn" onclick="sendTTS()">Озвучить</button>
+        </div>
+      </div>
+      <div class="p-card" style="margin-top:12px">
+        <div class="p-card-label">Инструменты</div>
+        <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px">
+          <button class="save-btn" style="padding:10px 8px" onclick="copyGuildId()">Копировать Guild ID</button>
+          <button class="save-btn" style="padding:10px 8px" onclick="pingServer()">Пинг сервера</button>
+          <button class="save-btn" style="padding:10px 8px" onclick="toggleAutoRefresh()">Автообновление: ON</button>
+          <button class="save-btn" style="padding:10px 8px" onclick="exportLibrary()">Экспорт библиотеки</button>
+          <button class="save-btn" style="padding:10px 8px" onclick="clearUiCache()">Очистить UI-кэш</button>
+          <button class="save-btn" style="padding:10px 8px" onclick="resetPlayerUi()">Сбросить UI плеера</button>
         </div>
       </div>
       <label class="upload-zone" for="fileIn">
@@ -1420,7 +1402,6 @@ let srvElapsed = 0;
 // Local elapsed interpolation
 let localElapsed = 0;
 let lastPollTime  = 0;
-let currentTrack = null;
 
 // ═══════════════════════════════════════════
 //  INIT
@@ -1712,28 +1693,52 @@ async function setSleepTimer(mins) {
   doPoll();
 }
 
-function seekBack30(){ seekRelative(-30); }
-function seekBack10(){ seekRelative(-10); }
-function seekForward10(){ seekRelative(10); }
-function seekForward30(){ seekRelative(30); }
-function setVolPreset(v){ setVol(v); }
-async function copyTextSafe(text, okMsg){
-  if (!text) { toast('Нет данных', 'err'); return; }
-  try { await navigator.clipboard.writeText(text); toast(okMsg || 'Скопировано'); }
-  catch { toast('Не удалось скопировать', 'err'); }
+
+let autoRefreshOn = true;
+function copyGuildId(){
+  const gid = (document.getElementById('guildInput').value || guildId || '').trim();
+  if (!gid) { toast('Guild ID пуст', 'err'); return; }
+  navigator.clipboard.writeText(gid).then(()=>toast('Guild ID скопирован')).catch(()=>toast('Не удалось скопировать', 'err'));
 }
-function copyTrackTitle(){ copyTextSafe((currentTrack && currentTrack.title) || '', 'Название скопировано'); }
-function copyTrackArtist(){ copyTextSafe((currentTrack && currentTrack.artist) || '', 'Исполнитель скопирован'); }
-function copyTrackUrl(){ copyTextSafe((currentTrack && (currentTrack.original_url || currentTrack.url)) || '', 'Ссылка скопирована'); }
-function openCurrentInYouTube(){
-  const u = currentTrack && (currentTrack.original_url || currentTrack.url);
-  if (!u) { toast('Для этого трека нет ссылки', 'err'); return; }
-  window.open(u, '_blank');
+async function pingServer(){
+  const t0 = performance.now();
+  try {
+    const r = await fetch('/api/config');
+    if (!r.ok) throw new Error('bad');
+    const ms = Math.round(performance.now() - t0);
+    toast('Пинг: ' + ms + 'ms');
+  } catch { toast('Сервер недоступен', 'err'); }
 }
-function refreshNow(){ doPoll(); toast('Обновлено'); }
-function toggleCompactMode(){ document.body.classList.toggle('compact'); }
-function toggleGlow(){ document.body.classList.toggle('no-glow'); }
-function focusSearchFromPlayer(){ goScreen('search'); setTimeout(()=>document.getElementById('searchIn').focus(), 140); }
+function toggleAutoRefresh(){
+  autoRefreshOn = !autoRefreshOn;
+  const btn = event && event.target;
+  if (btn) btn.textContent = 'Автообновление: ' + (autoRefreshOn ? 'ON' : 'OFF');
+  toast(autoRefreshOn ? 'Автообновление включено' : 'Автообновление выключено');
+}
+async function exportLibrary(){
+  try {
+    const r = await fetch('/api/library');
+    const data = await r.json();
+    const blob = new Blob([JSON.stringify(data, null, 2)], {type:'application/json'});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'library-export.json';
+    document.body.appendChild(a); a.click(); a.remove();
+    toast('Экспорт готов');
+  } catch { toast('Ошибка экспорта', 'err'); }
+}
+function clearUiCache(){
+  localStorage.removeItem('vol');
+  localStorage.removeItem('gid');
+  toast('UI-кэш очищен');
+}
+function resetPlayerUi(){
+  document.getElementById('progFill').style.width = '0%';
+  document.getElementById('mProg').style.width = '0%';
+  document.getElementById('tNow').textContent = '0:00';
+  toast('UI плеера сброшен');
+}
+
 async function sendTTS() {
   if (!guildId) { toast('Введи Guild ID в Профиле', 'err'); return; }
   const text = document.getElementById('ttsText').value.trim();
@@ -1847,7 +1852,7 @@ function startPoll() {
 }
 
 async function doPoll() {
-  if (!guildId) return;
+  if (!guildId || !autoRefreshOn) return;
   try {
     const r = await fetch('/api/status?guild_id=' + guildId);
     const s = await r.json();
@@ -1918,7 +1923,6 @@ async function doPoll() {
     isShuffle = s.shuffle;
 
     // Current track
-    currentTrack = s.current || null;
     if (s.current) {
       const t = s.current;
       document.getElementById('pTitle').textContent  = t.title  || 'Без названия';
@@ -1950,7 +1954,6 @@ async function doPoll() {
       document.getElementById('tEnd').textContent = '0:00';
       document.getElementById('progFill').style.width = '0%';
       document.getElementById('mProg').style.width = '0%';
-      currentTrack = null;
     }
 
     const queueSig = JSON.stringify((s.queue || []).map(t => [t.title, t.duration, t.artist]));
