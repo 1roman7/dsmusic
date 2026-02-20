@@ -89,7 +89,7 @@ def get_state(gid):
         player_state[gid] = {
             "vc":None,"volume":0.5,"current":None,"queue":[],"loop":False,
             "started_at":None,"elapsed_at_pause":0,"paused":False,
-            "history":[],"shuffle":False,"seek_offset":0,"sleep_until":None,"last_current":None
+            "history":[],"shuffle":False,"seek_offset":0,"sleep_until":None,"last_current":None,"seeking":False
         }
     return player_state[gid]
 
@@ -121,6 +121,9 @@ async def play_next(gid, seek_to=0):
 
     def after(err):
         if err: print(f"Error: {err}")
+        if s.get("seeking"):
+            s["seeking"] = False
+            return
         asyncio.run_coroutine_threadsafe(play_next(gid), bot.loop)
 
     try:
@@ -369,6 +372,7 @@ def api_status():
         "has_prev": len(s.get("history",[])) > 0,
         "elapsed": elapsed,
         "sleep_remaining": sleep_remaining,
+        "history": list(reversed((s.get("history") or [])[-30:])),
     })
 
 
@@ -488,6 +492,7 @@ def api_seek():
     dur = s["current"].get("duration",0)
     if dur and pos > dur: pos = dur
     # Останавливаем текущее и перезапускаем с нужной позиции
+    s["seeking"] = True
     if vc.is_playing() or vc.is_paused():
         vc.stop()
     # Небольшая задержка чтобы stop() сработал
@@ -497,7 +502,9 @@ def api_seek():
 
 async def _seek_play(gid, pos):
     s = get_state(gid); vc = s["vc"]
-    if not vc or not vc.is_connected() or not s["current"]: return
+    if not vc or not vc.is_connected() or not s["current"]:
+        s["seeking"] = False
+        return
     track = s["current"]
     s["seek_offset"] = pos
     s["started_at"] = time.time() - pos
@@ -520,7 +527,9 @@ async def _seek_play(gid, pos):
                 volume=s["volume"]
             )
         vc.play(src, after=after)
-    except Exception as e: print(f"seek_play: {e}")
+    except Exception as e:
+        s["seeking"] = False
+        print(f"seek_play: {e}")
 
 @app.route("/api/queue/remove", methods=["POST"])
 def api_queue_remove():
@@ -644,7 +653,7 @@ body{
 @keyframes fadeIn{from{opacity:0}to{opacity:1}}
 @keyframes scaleIn{from{opacity:0;transform:scale(.94)}to{opacity:1;transform:scale(1)}}
 @keyframes spin{to{transform:rotate(360deg)}}
-@keyframes glow-p{0%,100%{box-shadow:0 0 24px var(--glow)}50%{box-shadow:0 0 48px var(--glow),0 0 80px rgba(124,58,237,0.1)}}
+@keyframes glow-p{0%{box-shadow:0 0 18px rgba(124,58,237,.28);transform:scale(1)}50%{box-shadow:0 0 34px rgba(124,58,237,.45);transform:scale(1.02)}100%{box-shadow:0 0 18px rgba(124,58,237,.28);transform:scale(1)}}
 @keyframes eq1{0%,100%{transform:scaleY(.25)}50%{transform:scaleY(1)}}
 @keyframes eq2{0%,100%{transform:scaleY(.6)}33%{transform:scaleY(.15)}66%{transform:scaleY(1)}}
 @keyframes eq3{0%,100%{transform:scaleY(.8)}40%{transform:scaleY(.1)}80%{transform:scaleY(.9)}}
@@ -835,7 +844,7 @@ body{
   box-shadow:0 20px 60px rgba(0,0,0,.5);
   transition:box-shadow .5s;display:block;
 }
-.p-art.lit{animation:glow-p 4s ease-in-out infinite}
+.p-art.lit{animation:glow-p 6s cubic-bezier(.4,0,.2,1) infinite;will-change:transform,box-shadow}
 
 .p-meta{margin-bottom:18px}
 .p-title{font-size:1.2rem;font-weight:700;letter-spacing:-.3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -1190,7 +1199,7 @@ input[type=range]::-moz-range-thumb{
       </button>
     </div>
   </div>
-  <div class="scroll" id="sResults">
+  <div class="scroll" id="sResults" style="overflow-y:auto">
     <div class="empty"><div class="empty-i"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg></div><p>Введи название трека<br/>или исполнителя</p></div>
   </div>
 </div>
@@ -1277,17 +1286,6 @@ input[type=range]::-moz-range-thumb{
           <button class="save-btn" onclick="sendTTS()">Озвучить</button>
         </div>
       </div>
-      <div class="p-card" style="margin-top:12px">
-        <div class="p-card-label">Инструменты</div>
-        <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px">
-          <button class="save-btn" style="padding:10px 8px" onclick="copyGuildId()">Копировать Guild ID</button>
-          <button class="save-btn" style="padding:10px 8px" onclick="pingServer()">Пинг сервера</button>
-          <button class="save-btn" style="padding:10px 8px" onclick="toggleAutoRefresh()">Автообновление: ON</button>
-          <button class="save-btn" style="padding:10px 8px" onclick="exportLibrary()">Экспорт библиотеки</button>
-          <button class="save-btn" style="padding:10px 8px" onclick="clearUiCache()">Очистить UI-кэш</button>
-          <button class="save-btn" style="padding:10px 8px" onclick="resetPlayerUi()">Сбросить UI плеера</button>
-        </div>
-      </div>
       <label class="upload-zone" for="fileIn">
         <svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
         <div class="upload-zone-text"><strong>Загрузить свой трек</strong><span>Нажми чтобы выбрать аудио файл</span></div>
@@ -1304,6 +1302,24 @@ input[type=range]::-moz-range-thumb{
       <div>
         <div class="sec-title" style="padding:4px 4px 10px">Загруженные треки</div>
         <div class="lib-rows" id="profLib"></div>
+      </div>
+      <div class="p-card" style="margin-top:12px">
+        <div class="p-card-label" style="display:flex;justify-content:space-between;align-items:center">
+          <span>История воспроизведения</span>
+          <button class="lr-btn" style="height:28px;padding:0 10px" onclick="toggleHistory()">История</button>
+        </div>
+        <div class="lib-rows" id="historyList"></div>
+      </div>
+      <div class="p-card" style="margin-top:12px">
+        <div class="p-card-label">Инструменты</div>
+        <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px">
+          <button class="save-btn" style="padding:10px 8px" onclick="copyGuildId()">Копировать Guild ID</button>
+          <button class="save-btn" style="padding:10px 8px" onclick="pingServer()">Пинг сервера</button>
+          <button class="save-btn" style="padding:10px 8px" onclick="toggleAutoRefresh(event)">Автообновление: ON</button>
+          <button class="save-btn" style="padding:10px 8px" onclick="exportLibrary()">Экспорт библиотеки</button>
+          <button class="save-btn" style="padding:10px 8px" onclick="clearUiCache()">Очистить UI-кэш</button>
+          <button class="save-btn" style="padding:10px 8px" onclick="resetPlayerUi()">Сбросить UI плеера</button>
+        </div>
       </div>
     </div>
   </div>
@@ -1382,6 +1398,19 @@ input[type=range]::-moz-range-thumb{
   </div>
 </div>
 
+<div class="overlay" id="histOverlay">
+  <div class="sheet sheet-anim" style="max-height:80vh;display:flex;flex-direction:column">
+    <div class="handle"></div>
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;flex-shrink:0">
+      <div class="sheet-title" style="margin:0">Последние 30 треков</div>
+      <button onclick="closeHistory()" style="background:none;border:none;color:var(--sub);cursor:pointer;display:flex;padding:4px">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </div>
+    <div style="overflow-y:auto;flex:1" id="historyAll"></div>
+  </div>
+</div>
+
 <div class="load-panel" id="loadPanel">
   <div class="lp-spinner"></div>
   <div class="lp-text">Загрузка трека...</div>
@@ -1408,6 +1437,9 @@ let srvElapsed = 0;
 // Local elapsed interpolation
 let localElapsed = 0;
 let lastPollTime  = 0;
+let autoRefreshOn = true;
+let historyTracks = [];
+window.renderThumb = function(t, cls){ return `<div class="${cls}"><div class="t-placeholder"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13M9 18c0 1.1-.9 2-2 2s-2-.9-2-2 .9-2 2-2 2 .9 2 2zm12-2c0 1.1-.9 2-2 2s-2-.9-2-2 .9-2 2-2 2 .9 2 2z"/></svg></div></div>`; };
 
 // ═══════════════════════════════════════════
 //  INIT
@@ -1700,7 +1732,6 @@ async function setSleepTimer(mins) {
 }
 
 
-let autoRefreshOn = true;
 function copyGuildId(){
   const gid = (document.getElementById('guildInput').value || guildId || '').trim();
   if (!gid) { toast('Guild ID пуст', 'err'); return; }
@@ -1715,9 +1746,9 @@ async function pingServer(){
     toast('Пинг: ' + ms + 'ms');
   } catch { toast('Сервер недоступен', 'err'); }
 }
-function toggleAutoRefresh(){
+function toggleAutoRefresh(e){
   autoRefreshOn = !autoRefreshOn;
-  const btn = event && event.target;
+  const btn = e && e.target;
   if (btn) btn.textContent = 'Автообновление: ' + (autoRefreshOn ? 'ON' : 'OFF');
   toast(autoRefreshOn ? 'Автообновление включено' : 'Автообновление выключено');
 }
@@ -1744,6 +1775,24 @@ function resetPlayerUi(){
   document.getElementById('tNow').textContent = '0:00';
   toast('UI плеера сброшен');
 }
+
+
+function renderHistory(limit = 5){
+  const list = document.getElementById('historyList');
+  const all = document.getElementById('historyAll');
+  if (!list || !all) return;
+  const arr = (historyTracks || []);
+  if (!arr.length){
+    const empty = '<div class="empty" style="padding:14px 0"><p>История пока пуста</p></div>';
+    list.innerHTML = empty; all.innerHTML = empty; return;
+  }
+  const mk = (t, i) => '<div class="lib-row" style="padding:6px 0"><span class="q-n">'+(i+1)+'</span>'+window.renderThumb(t,'lr-art')+'<div class="lr-info"><div class="lr-title">'+(t.title||'Без названия')+'</div><div class="lr-sub">'+(t.artist||'—')+'</div></div></div>';
+  list.innerHTML = arr.slice(0, limit).map((t,i)=>mk(t,i)).join('');
+  all.innerHTML = arr.map((t,i)=>mk(t,i)).join('');
+}
+function toggleHistory(){ document.getElementById('histOverlay').classList.add('show'); }
+function closeHistory(){ document.getElementById('histOverlay').classList.remove('show'); }
+document.getElementById('histOverlay').addEventListener('click', e => { if (e.target === e.currentTarget) closeHistory(); });
 
 async function sendTTS() {
   if (!guildId) { toast('Введи Guild ID в Профиле', 'err'); return; }
@@ -1928,9 +1977,13 @@ async function doPoll() {
     document.getElementById('btnShuffle').className = 'c-side' + (s.shuffle ? ' on' : '');
     isShuffle = s.shuffle;
 
+    historyTracks = s.history || [];
+    renderHistory(5);
+
     // Current track
-    if (s.current) {
-      const t = s.current;
+    const currentUi = s.current || null;
+    if (currentUi) {
+      const t = currentUi;
       document.getElementById('pTitle').textContent  = t.title  || 'Без названия';
       document.getElementById('pArtist').textContent = t.artist || '—';
       document.getElementById('mTitle').textContent  = t.title  || '—';
