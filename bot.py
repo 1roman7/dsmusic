@@ -80,6 +80,12 @@ intents.message_content = True
 intents.voice_states = True
 bot = commands.Bot(command_prefix="/", intents=intents)
 player_state = {}
+state_locks = {}
+
+def get_lock(gid):
+    if gid not in state_locks:
+        state_locks[gid] = threading.Lock()
+    return state_locks[gid]
 
 YDL_STREAM = {"format":"bestaudio/best","quiet":True,"no_warnings":True,"source_address":"0.0.0.0","noplaylist":True}
 FFMPEG_OPTS = {"before_options":"-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5","options":"-vn"}
@@ -317,102 +323,119 @@ def api_play():
     if not gid: return jsonify({"error":"No guild_id"}),400
     s = get_state(gid)
     if not s["vc"] or not s["vc"].is_connected(): return jsonify({"error":"Сначала используй /plus в Discord"}),400
-    track_obj = None
-    if track.get("source")=="library" and track.get("file_path"):
-        track_obj = {"type":"file","title":track.get("title",""),"thumbnail":track.get("thumbnail",""),
-            "duration":track.get("duration",0),"file_path":track["file_path"],"artist":track.get("artist","")}
-    else:
-        try:
-            ydl_opts = {**YDL_STREAM}
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(track.get("url",""), download=False)
-                fmts = info.get("formats",[])
-                au = None
-                # Ищем лучший аудио-формат
-                for f in reversed(fmts):
-                    if f.get("acodec") and f["acodec"] != "none" and (f.get("vcodec") == "none" or not f.get("vcodec")):
-                        au = f.get("url")
-                        break
-                if not au and fmts:
-                    au = fmts[-1].get("url")
-                if not au:
-                    au = info.get("url","")
-                track_obj = {"type":"stream","title":info.get("title",""),"thumbnail":info.get("thumbnail",""),
-                    "duration":info.get("duration",0),"stream_url":au,"original_url":track.get("url",""),"artist":info.get("uploader","")}
-        except Exception as e:
-            print(f"[!] YT play error: {e}")
-            return jsonify({"error":f"Ошибка загрузки: {str(e)}"}),500
-    if track_obj:
-        if play_now and (s["vc"].is_playing() or s["vc"].is_paused()):
-            if s.get("current"):
-                s["history"].append(s["current"])
-            s["queue"].insert(0, track_obj)
-            s["current"] = None
-            s["vc"].stop()
+    with get_lock(gid):
+        track_obj = None
+        if track.get("source")=="library" and track.get("file_path"):
+            track_obj = {"type":"file","title":track.get("title",""),"thumbnail":track.get("thumbnail",""),
+                "duration":track.get("duration",0),"file_path":track["file_path"],"artist":track.get("artist","")}
         else:
-            s["queue"].append(track_obj)
-    if not s["vc"].is_playing() and not s["vc"].is_paused():
-        asyncio.run_coroutine_threadsafe(play_next(gid), bot.loop)
+            try:
+                ydl_opts = {**YDL_STREAM}
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(track.get("url",""), download=False)
+                    fmts = info.get("formats",[])
+                    au = None
+                    # Ищем лучший аудио-формат
+                    for f in reversed(fmts):
+                        if f.get("acodec") and f["acodec"] != "none" and (f.get("vcodec") == "none" or not f.get("vcodec")):
+                            au = f.get("url")
+                            break
+                    if not au and fmts:
+                        au = fmts[-1].get("url")
+                    if not au:
+                        au = info.get("url","")
+                    track_obj = {"type":"stream","title":info.get("title",""),"thumbnail":info.get("thumbnail",""),
+                        "duration":info.get("duration",0),"stream_url":au,"original_url":track.get("url",""),"artist":info.get("uploader","")}
+            except Exception as e:
+                print(f"[!] YT play error: {e}")
+                return jsonify({"error":f"Ошибка загрузки: {str(e)}"}),500
+        if track_obj:
+            if play_now and (s["vc"].is_playing() or s["vc"].is_paused()):
+                if s.get("current"):
+                    s["history"].append(s["current"])
+                s["queue"].insert(0, track_obj)
+                s["current"] = None
+                s["vc"].stop()
+            else:
+                s["queue"].append(track_obj)
+        if not s["vc"].is_playing() and not s["vc"].is_paused():
+            asyncio.run_coroutine_threadsafe(play_next(gid), bot.loop)
     return jsonify({"status":"ok"})
 
 @app.route("/api/control", methods=["POST"])
 def api_control():
-    data = request.json; gid = int(data.get("guild_id",0)); action = data.get("action","")
-    s = get_state(gid); vc = s["vc"]
-    if action=="pause":
-        if vc and vc.is_playing():
-            vc.pause()
-            s["paused"] = True
-            s["elapsed_at_pause"] = int(time.time() - (s["started_at"] or time.time()))
-    elif action=="resume":
-        if vc and vc.is_paused():
-            vc.resume()
-            s["paused"] = False
-            s["started_at"] = time.time() - s["elapsed_at_pause"]
-    elif action=="skip":
-        print(f"[*] Control: SKIP (Guild {gid})")
-        if vc and (vc.is_playing() or vc.is_paused()): vc.stop()
-        else: # Force play next if something is stuck
-            asyncio.run_coroutine_threadsafe(play_next(gid), bot.loop)
-    elif action=="prev":
-        print(f"[*] Control: PREV (Guild {gid})")
-        if s.get("history") and len(s["history"]) > 0:
-            if s["current"]:
-                s["queue"].insert(0, s["current"])
-            s["queue"].insert(0, s["history"].pop())
-            s["current"] = None
-            s["seek_offset"] = 0
-            if vc and (vc.is_playing() or vc.is_paused()): vc.stop()
-            else: # Force play next if something is stuck
+    data = request.json or {}
+    gid = int(data.get("guild_id", 0))
+    action = data.get("action", "")
+    s = get_state(gid)
+    vc = s["vc"]
+    with get_lock(gid):
+        if action == "pause":
+            if vc and vc.is_playing():
+                vc.pause()
+                s["paused"] = True
+                s["elapsed_at_pause"] = int(time.time() - (s["started_at"] or time.time()))
+        elif action == "resume":
+            if vc and vc.is_paused():
+                vc.resume()
+                s["paused"] = False
+                s["started_at"] = time.time() - s["elapsed_at_pause"]
+        elif action == "skip":
+            if vc and (vc.is_playing() or vc.is_paused()):
+                vc.stop()
+            else:
                 asyncio.run_coroutine_threadsafe(play_next(gid), bot.loop)
-        else:
-            print("[!] Control: PREV - History is empty")
-    elif action=="stop":
-        s["queue"]=[]; s["current"]=None; s["started_at"]=None; s["history"]=[]
-        if vc and (vc.is_playing() or vc.is_paused()): vc.stop()
-    elif action=="volume":
-        try:
-            new_vol = float(data.get("value",0.5))
-        except (TypeError, ValueError):
-            new_vol = 0.5
-        s["volume"]=max(0.0,min(2.0,new_vol))
-        if vc and vc.source: vc.source.volume=s["volume"]
-    elif action=="loop":
-        s["loop"]=not s["loop"]
-    elif action=="shuffle":
-        s["shuffle"]=not s.get("shuffle",False)
-        if s["shuffle"] and s["queue"]:
-            random.shuffle(s["queue"])
-    elif action=="clear_queue":
-        s["queue"] = []
-    elif action=="sleep_timer":
-        mins = int(data.get("minutes", 0) or 0)
-        s["sleep_until"] = (time.time() + mins * 60) if mins > 0 else None
-    elif action=="disconnect":
-        if vc and vc.is_connected():
-            asyncio.run_coroutine_threadsafe(vc.disconnect(), bot.loop)
-            s["vc"]=None; s["current"]=None; s["queue"]=[]; s["started_at"]=None; s["history"]=[]; s["sleep_until"]=None
-    return jsonify({"status":"ok","loop":s.get("loop",False),"shuffle":s.get("shuffle",False),"sleep_until":s.get("sleep_until")})
+        elif action == "prev":
+            if s.get("history") and len(s["history"]) > 0:
+                if s["current"]:
+                    s["queue"].insert(0, s["current"])
+                s["queue"].insert(0, s["history"].pop())
+                s["current"] = None
+                s["seek_offset"] = 0
+                if vc and (vc.is_playing() or vc.is_paused()):
+                    vc.stop()
+                else:
+                    asyncio.run_coroutine_threadsafe(play_next(gid), bot.loop)
+        elif action == "stop":
+            s["queue"] = []
+            s["current"] = None
+            s["started_at"] = None
+            s["history"] = []
+            if vc and (vc.is_playing() or vc.is_paused()):
+                vc.stop()
+        elif action == "volume":
+            try:
+                new_vol = float(data.get("value", 0.5))
+            except (TypeError, ValueError):
+                new_vol = 0.5
+            s["volume"] = max(0.0, min(2.0, new_vol))
+            if vc and vc.source:
+                try:
+                    vc.source.volume = s["volume"]
+                except Exception:
+                    pass
+        elif action == "loop":
+            s["loop"] = not s["loop"]
+        elif action == "shuffle":
+            s["shuffle"] = not s.get("shuffle", False)
+            if s["shuffle"] and s["queue"]:
+                random.shuffle(s["queue"])
+        elif action == "clear_queue":
+            s["queue"] = []
+        elif action == "sleep_timer":
+            mins = int(data.get("minutes", 0) or 0)
+            s["sleep_until"] = (time.time() + mins * 60) if mins > 0 else None
+        elif action == "disconnect":
+            if vc and vc.is_connected():
+                asyncio.run_coroutine_threadsafe(vc.disconnect(), bot.loop)
+                s["vc"] = None
+                s["current"] = None
+                s["queue"] = []
+                s["started_at"] = None
+                s["history"] = []
+                s["sleep_until"] = None
+
+        return jsonify({"status": "ok", "loop": s.get("loop", False), "shuffle": s.get("shuffle", False), "sleep_until": s.get("sleep_until")})
 
 @app.route("/api/status")
 def api_status():
@@ -460,6 +483,7 @@ def api_tts():
 
     s = get_state(gid)
     vc = s["vc"]
+    lock = get_lock(gid)
     if not vc or not vc.is_connected():
         return jsonify({"error": "Сначала используй /plus в Discord"}), 400
 
@@ -469,14 +493,15 @@ def api_tts():
         gTTS(text=text, lang=lang).save(fp)
 
         # If something is currently playing, overlay TTS live without restarting track.
-        if vc.is_playing() and vc.source:
-            overlay_src = discord.FFmpegPCMAudio(fp, options='-vn')
-            cur_src = vc.source
-            if isinstance(cur_src, OverlayAudioSource):
-                cur_src.add_overlay(overlay_src)
-            else:
-                vc.source = OverlayAudioSource(cur_src, overlay_src)
-            return jsonify({"status": "ok", "mode": "overlay"})
+        with lock:
+            if vc.is_playing() and vc.source:
+                overlay_src = discord.FFmpegPCMAudio(fp, options='-vn')
+                cur_src = vc.source
+                if isinstance(cur_src, OverlayAudioSource):
+                    cur_src.add_overlay(overlay_src)
+                else:
+                    vc.source = OverlayAudioSource(cur_src, overlay_src)
+                return jsonify({"status": "ok", "mode": "overlay"})
 
         # If paused or idle, queue as regular TTS item.
         tts_dur = 2
@@ -497,29 +522,38 @@ def api_tts():
             "thumbnail": "",
             "file_path": fp,
         }
-        s["queue"].insert(0, tts_track)
-        if not vc.is_paused() and not vc.is_playing():
-            asyncio.run_coroutine_threadsafe(play_next(gid), bot.loop)
+        with lock:
+            s["queue"].insert(0, tts_track)
+            if not vc.is_paused() and not vc.is_playing():
+                asyncio.run_coroutine_threadsafe(play_next(gid), bot.loop)
         return jsonify({"status": "ok", "mode": "queued"})
     except Exception as e:
         return jsonify({"error": f"Не удалось озвучить: {e}"}), 500
 
 @app.route("/api/seek", methods=["POST"])
 def api_seek():
-    data = request.json; gid = int(data.get("guild_id",0)); pos = int(data.get("position",0))
-    s = get_state(gid); vc = s["vc"]
-    if not vc or not s["current"]: return jsonify({"error":"Ничего не играет"}),400
-    if pos < 0: pos = 0
-    dur = s["current"].get("duration",0)
-    if dur and pos > dur: pos = dur
-    # Останавливаем текущее и перезапускаем с нужной позиции
-    s["seeking"] = True
-    if vc.is_playing() or vc.is_paused():
-        vc.stop()
-    # Небольшая задержка чтобы stop() сработал
-    import time as _t; _t.sleep(0.1)
+    data = request.json or {}
+    gid = int(data.get("guild_id", 0))
+    pos = int(data.get("position", 0))
+    s = get_state(gid)
+    vc = s["vc"]
+
+    with get_lock(gid):
+        if not vc or not s["current"]:
+            return jsonify({"error": "Ничего не играет"}), 400
+        if pos < 0:
+            pos = 0
+        dur = s["current"].get("duration", 0)
+        if dur and pos > dur:
+            pos = dur
+        s["seeking"] = True
+        if vc.is_playing() or vc.is_paused():
+            vc.stop()
+
+    import time as _t
+    _t.sleep(0.1)
     asyncio.run_coroutine_threadsafe(_seek_play(gid, pos), bot.loop)
-    return jsonify({"status":"ok","position":pos})
+    return jsonify({"status": "ok", "position": pos})
 
 async def _seek_play(gid, pos):
     s = get_state(gid); vc = s["vc"]
@@ -570,7 +604,7 @@ def api_queue_move():
     if 0 <= frm < len(q) and 0 <= to < len(q) and frm != to:
         item = q.pop(frm)
         q.insert(to, item)
-        return jsonify({"status":"ok"})
+    return jsonify({"status":"ok"})
     return jsonify({"error":"Invalid index"}),400
 
 @app.route("/api/upload", methods=["POST"])
@@ -1453,6 +1487,9 @@ let isShuffle = false;
 let pollTid   = null;
 let prevVol   = 50;
 let lastQueueSig = '';
+let lastHistorySig = '';
+let lastTrackSig = '';
+let lastPlayingState = false;
 // Server-side elapsed — updated from /api/status
 let srvElapsed = 0;
 // Local elapsed interpolation
@@ -1523,6 +1560,19 @@ function setThumbElement(el, track, cls) {
 
   if (el !== node) el.replaceWith(node);
 }
+
+
+const escAttr = v => String(v || '').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+function getThumbPlaceholder(cls) {
+  return `<div class="${cls}"><div class="t-placeholder"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13M9 18c0 1.1-.9 2-2 2s-2-.9-2-2 .9-2 2-2 2 .9 2 2zm12-2c0 1.1-.9 2-2 2s-2-.9-2-2 .9-2 2-2 2 .9 2 2z"/></svg></div></div>`;
+}
+function getThumb(t, cls) {
+  if (t && t.thumbnail && t.thumbnail.startsWith('http')) {
+    return `<img class="${cls}" src="${escAttr(t.thumbnail)}" loading="lazy" />`;
+  }
+  return getThumbPlaceholder(cls);
+}
+window.renderThumb = getThumb;
 
 function toast(msg, type = 'ok') {
   const w = document.getElementById('toasts');
@@ -1951,20 +2001,6 @@ async function doPoll() {
       sleepEl.textContent = s.sleep_remaining > 0 ? ('Сон: ' + fmt(s.sleep_remaining)) : 'Сон: выкл';
     }
 
-    // Help function for thumbnails
-    const escAttr = v => String(v || '').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-    const getThumb = (t, cls) => {
-      if (t.thumbnail && t.thumbnail.startsWith('http')) {
-        const safeSrc = escAttr(t.thumbnail);
-        return `<img class="${cls}" src="${safeSrc}" loading="lazy" />`;
-      }
-      return getThumbPlaceholder(cls);
-    };
-    const getThumbPlaceholder = (cls) => {
-      return `<div class="${cls}"><div class="t-placeholder"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13M9 18c0 1.1-.9 2-2 2s-2-.9-2-2 .9-2 2-2 2 .9 2 2zm12-2c0 1.1-.9 2-2 2s-2-.9-2-2 .9-2 2-2 2 .9 2 2z"/></svg></div></div>`;
-    };
-    window.renderThumb = getThumb; // make it global for other functions
-
     // Sync local elapsed with server value
     localElapsed = srvElapsed;
 
@@ -1998,23 +2034,32 @@ async function doPoll() {
     document.getElementById('btnShuffle').className = 'c-side' + (s.shuffle ? ' on' : '');
     isShuffle = s.shuffle;
 
-    historyTracks = s.history || [];
-    renderHistory(5);
+    const hSig = JSON.stringify((s.history || []).map(t => [t.title, t.artist, t.duration]));
+    if (hSig !== lastHistorySig) {
+      historyTracks = s.history || [];
+      renderHistory(5);
+      lastHistorySig = hSig;
+    }
 
     // Current track
     const currentUi = s.current || null;
     if (currentUi) {
       const t = currentUi;
-      document.getElementById('pTitle').textContent  = t.title  || 'Без названия';
-      document.getElementById('pArtist').textContent = t.artist || '—';
-      document.getElementById('mTitle').textContent  = t.title  || '—';
-      document.getElementById('mSub').textContent    = t.artist || '—';
-      
-      setThumbElement(document.getElementById('pArt'), t, 'p-art' + (s.playing ? ' lit' : ''));
-      setThumbElement(document.getElementById('mArt'), t, 'mini-art');
+      const trackSig = JSON.stringify([t.id || t.file_path || t.stream_url || t.title, t.title, t.artist, t.thumbnail, t.duration]);
+      if (trackSig !== lastTrackSig || lastPlayingState !== !!s.playing) {
+        document.getElementById('pTitle').textContent  = t.title  || 'Без названия';
+        document.getElementById('pArtist').textContent = t.artist || '—';
+        document.getElementById('mTitle').textContent  = t.title  || '—';
+        document.getElementById('mSub').textContent    = t.artist || '—';
 
-      totalDur = t.duration || 0;
-      document.getElementById('tEnd').textContent = totalDur > 0 ? fmt(totalDur) : '—:—';
+        setThumbElement(document.getElementById('pArt'), t, 'p-art' + (s.playing ? ' lit' : ''));
+        setThumbElement(document.getElementById('mArt'), t, 'mini-art');
+
+        totalDur = t.duration || 0;
+        document.getElementById('tEnd').textContent = totalDur > 0 ? fmt(totalDur) : '—:—';
+        lastTrackSig = trackSig;
+      }
+      lastPlayingState = !!s.playing;
       document.getElementById('tNow').textContent = fmt(srvElapsed);
 
       // Show mini player ONLY when on non-player screens
@@ -2034,6 +2079,7 @@ async function doPoll() {
       document.getElementById('tEnd').textContent = '0:00';
       document.getElementById('progFill').style.width = '0%';
       document.getElementById('mProg').style.width = '0%';
+      lastTrackSig = '';
     }
 
     const queueSig = JSON.stringify((s.queue || []).map(t => [t.title, t.duration, t.artist]));
