@@ -110,6 +110,8 @@ async def play_next(gid, seek_to=0):
         s["current"] = track
     else:
         s["current"] = None; s["started_at"] = None; s["seek_offset"] = 0; return
+    if not seek_to and isinstance(track, dict) and track.get("_resume_from"):
+        seek_to = int(track.get("_resume_from", 0))
     s["seek_offset"] = seek_to
     s["started_at"] = time.time() - seek_to
     s["elapsed_at_pause"] = 0
@@ -334,7 +336,7 @@ def api_status():
     })
 
 
-def build_tts_overlay_track(current_track, tts_file, elapsed_sec):
+def build_tts_overlay_track(current_track, tts_file, elapsed_sec, tts_duration):
     """Create a temporary mixed track where TTS overlays current music."""
     if not current_track:
         return None
@@ -347,7 +349,7 @@ def build_tts_overlay_track(current_track, tts_file, elapsed_sec):
         "-ss", str(max(0, int(elapsed_sec))),
         "-i", src,
         "-i", tts_file,
-        "-filter_complex", "[0:a]volume=0.42[m];[1:a]volume=1.65[t];[m][t]amix=inputs=2:duration=first:dropout_transition=0[a]",
+        "-filter_complex", f"[0:a]atrim=0:{max(1, int(tts_duration)+1)},volume=0.42[m];[1:a]volume=1.65[t];[m][t]amix=inputs=2:duration=first:dropout_transition=0[a]",
         "-map", "[a]",
         "-c:a", "libmp3lame", "-q:a", "4",
         out_fp,
@@ -398,20 +400,31 @@ def api_tts():
         tts_id = str(uuid.uuid4())
         fp = os.path.join(UPLOAD_FOLDER, f"tts_{tts_id}.mp3")
         gTTS(text=text, lang=lang).save(fp)
+        tts_dur = 0
+        try:
+            tts_a = MutaFile(fp)
+            if tts_a and tts_a.info:
+                tts_dur = max(1, int(tts_a.info.length))
+        except Exception:
+            tts_dur = 0
+
         tts_track = {
             "id": tts_id,
             "type": "file",
             "source": "tts",
             "title": "TTS сообщение",
             "artist": "Озвучка",
-            "duration": 0,
+            "duration": tts_dur,
             "thumbnail": "",
             "file_path": fp,
         }
-        if (vc.is_playing() or vc.is_paused()) and s.get("current"):
+        if (vc.is_playing() or vc.is_paused()) and s.get("current") and tts_dur > 0:
             elapsed = s.get("elapsed_at_pause", 0) if vc.is_paused() else int(time.time() - (s.get("started_at") or time.time()))
-            overlay_track = build_tts_overlay_track(s.get("current"), fp, elapsed)
+            overlay_track = build_tts_overlay_track(s.get("current"), fp, elapsed, tts_dur)
             if overlay_track:
+                resume_track = dict(s["current"])
+                resume_track["_resume_from"] = max(0, elapsed + tts_dur)
+                s["queue"].insert(0, resume_track)
                 s["queue"].insert(0, overlay_track)
                 s["current"] = None
                 vc.stop()
@@ -1727,9 +1740,11 @@ async function doPoll() {
     }
 
     // Help function for thumbnails
+    const escAttr = v => String(v || '').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
     const getThumb = (t, cls) => {
       if (t.thumbnail && t.thumbnail.startsWith('http')) {
-        return `<img class="${cls}" src="${t.thumbnail}" onerror="this.outerHTML=getThumbPlaceholder('${cls}')" />`;
+        const safeSrc = escAttr(t.thumbnail);
+        return `<img class="${cls}" src="${safeSrc}" loading="lazy" />`;
       }
       return getThumbPlaceholder(cls);
     };
