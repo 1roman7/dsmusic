@@ -188,21 +188,55 @@ def api_config():
 @app.route("/api/search")
 def api_search():
     q = request.args.get("q","").strip()
-    if not q: return jsonify([])
+    offset = max(0, int(request.args.get("offset", 0) or 0))
+    limit = max(1, min(25, int(request.args.get("limit", 15) or 15)))
+    if not q:
+        return jsonify({"items": [], "next_offset": 0, "has_more": False})
+
+    def tok(txt):
+        txt = (txt or "").lower()
+        for ch in [',', '.', '!', '?', '(', ')', '[', ']', '{', '}', '\\', '/', '|', "'", '"']:
+            txt = txt.replace(ch, " ")
+        return [x for x in txt.split() if x]
+
+    q_tokens = tok(q)
     results = []
-    for t in load_library():
-        if q.lower() in t.get("title","").lower() or q.lower() in t.get("artist","").lower():
-            results.append({**t,"source":"library"})
+    if offset == 0:
+        for t in load_library():
+            title = (t.get("title") or "").lower()
+            artist = (t.get("artist") or "").lower()
+            if q.lower() in title or q.lower() in artist:
+                results.append({**t, "source": "library"})
+                continue
+            if q_tokens and any(token in title or token in artist for token in q_tokens):
+                results.append({**t, "source": "library"})
+
     try:
+        needed = min(100, offset + limit)
         with yt_dlp.YoutubeDL({"quiet":True,"no_warnings":True,"extract_flat":True,"skip_download":True}) as ydl:
-            info = ydl.extract_info(f"ytsearch10:{q}", download=False)
-            for e in (info.get("entries") or []):
-                vid = e.get("id","")
-                results.append({"id":vid,"title":e.get("title","Unknown"),"duration":e.get("duration",0),
-                    "thumbnail":f"https://img.youtube.com/vi/{vid}/mqdefault.jpg",
-                    "url":f"https://www.youtube.com/watch?v={vid}","source":"youtube"})
-    except Exception as e: print(f"YT: {e}")
-    return jsonify(results)
+            info = ydl.extract_info(f"ytsearch{needed}:{q}", download=False)
+            entries = info.get("entries") or []
+            page_entries = entries[offset:offset + limit]
+            for e in page_entries:
+                vid = e.get("id", "")
+                results.append({
+                    "id": vid,
+                    "title": e.get("title", "Unknown"),
+                    "duration": e.get("duration", 0),
+                    "thumbnail": f"https://img.youtube.com/vi/{vid}/mqdefault.jpg",
+                    "url": f"https://www.youtube.com/watch?v={vid}",
+                    "source": "youtube"
+                })
+            has_more = len(entries) > (offset + limit) and needed < 100
+    except Exception as e:
+        print(f"YT: {e}")
+        has_more = False
+
+    return jsonify({
+        "items": results,
+        "next_offset": offset + limit,
+        "has_more": has_more,
+    })
 
 @app.route("/api/play", methods=["POST"])
 def api_play():
@@ -1466,6 +1500,11 @@ function applyGuild() {
 //  SEARCH
 // ═══════════════════════════════════════════
 let sDebounce = null;
+let searchQ = "";
+let searchOffset = 0;
+let searchHasMore = false;
+let searchLoading = false;
+let searchItems = [];
 function onSInput() {
   const v = document.getElementById('searchIn').value;
   document.getElementById('sClear').className = 's-clear' + (v ? ' show' : '');
@@ -1473,6 +1512,7 @@ function onSInput() {
   if (v.length > 1) sDebounce = setTimeout(doSearch, 550);
 }
 function clearS() {
+  searchQ = ''; searchOffset = 0; searchHasMore = false; searchLoading = false; searchItems = [];
   document.getElementById('searchIn').value = '';
   document.getElementById('sClear').className = 's-clear';
   document.getElementById('sResults').innerHTML =
@@ -1481,15 +1521,37 @@ function clearS() {
 async function doSearch() {
   const q = document.getElementById('searchIn').value.trim();
   if (!q) return;
+  searchQ = q;
+  searchOffset = 0;
+  searchHasMore = false;
+  searchLoading = false;
+  searchItems = [];
   const wrap = document.getElementById('sResults');
   wrap.innerHTML = '<div class="loader"><div class="spinner"></div>Ищем...</div>';
-  try {
-    const r = await fetch('/api/search?q=' + encodeURIComponent(q));
-    const data = await r.json();
-    renderSearch(data);
-  } catch { toast('Ошибка поиска', 'err'); wrap.innerHTML = ''; }
+  await loadMoreSearch(true);
 }
-function renderSearch(items) {
+
+async function loadMoreSearch(reset = false) {
+  if (!searchQ || searchLoading) return;
+  if (!reset && !searchHasMore) return;
+  searchLoading = true;
+  try {
+    const r = await fetch('/api/search?q=' + encodeURIComponent(searchQ) + '&offset=' + searchOffset + '&limit=15');
+    const data = await r.json();
+    const items = data.items || [];
+    if (reset) searchItems = items;
+    else searchItems = searchItems.concat(items);
+    searchOffset = data.next_offset || (searchOffset + items.length);
+    searchHasMore = !!data.has_more;
+    renderSearch(searchItems, searchHasMore);
+  } catch {
+    toast('Ошибка поиска', 'err');
+  } finally {
+    searchLoading = false;
+  }
+}
+
+function renderSearch(items, hasMore = false) {
   const wrap = document.getElementById('sResults');
   wrap.innerHTML = '';
   if (!items.length) {
@@ -1506,7 +1568,23 @@ function renderSearch(items) {
     const h = document.createElement('div'); h.className = 'sec-head'; h.textContent = 'YouTube'; wrap.appendChild(h);
     yt.forEach((t, i) => wrap.appendChild(mkResult(t, i + lib.length)));
   }
+  if (hasMore) {
+    const more = document.createElement('div');
+    more.className = 'loader';
+    more.style.padding = '16px';
+    more.innerHTML = '<div class="spinner"></div>Загружаем ещё...';
+    wrap.appendChild(more);
+  }
 }
+
+document.getElementById('sResults').addEventListener('scroll', () => {
+  const el = document.getElementById('sResults');
+  if (!searchHasMore || searchLoading) return;
+  if (el.scrollTop + el.clientHeight >= el.scrollHeight - 180) {
+    loadMoreSearch();
+  }
+});
+
 function mkResult(t, idx) {
   const isLib = t.source === 'library';
   const el = document.createElement('div');
